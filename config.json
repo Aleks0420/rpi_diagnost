@@ -1,0 +1,75 @@
+{
+    "device_id": "station_1",
+    "mqtt": {
+        "broker": "192.168.0.93",
+        "port": 1883,
+        "topic": "sensors/data",
+        "qos": 1
+    },
+    "intervals": {
+        "temperature_sec": 5.0,
+        "fast_sensors_sec": 0.333
+    },
+    "sensors": {
+        "mpu6050": [
+            {
+                "name": "engine",
+                "address": "0x68",
+                "bus": 1,
+                "sample_rate_hz": 200,
+                "buffer_size": 200
+            },
+            {
+                "name": "gearbox",
+                "address": "0x69",
+                "bus": 1,
+                "sample_rate_hz": 200,
+                "buffer_size": 200
+            }
+        ],
+        "mpu6050_fft": {
+            "n_peaks": 10
+        },
+        "ds18b20": [
+            {
+                "name": "engine_temp",
+                "id": "28-ed9c0d1e64ff"
+            },
+            {
+                "name": "gearbox_temp",
+                "id": "28-f97b081e64ff"
+            }
+        ],
+        "current": {
+            "adc": {
+                "bus": 1,
+                "address": "0x48",
+                "gain": 1.0
+            },
+            "channels": [
+                {
+                    "name": "phase_a",
+                    "adc_channel": 0,
+                    "offset": 0.0,
+                    "scale": 1.0
+                },
+                {
+                    "name": "phase_b",
+                    "adc_channel": 1,
+                    "offset": 0.0,
+                    "scale": 1.0
+                },
+                {
+                    "name": "phase_c",
+                    "adc_channel": 2,
+                    "offset": 0.0,
+                    "scale": 0.9
+                }
+            ]
+        }
+    },
+    "calibration": {
+        "mpu": true,
+        "current": true
+    }
+}
