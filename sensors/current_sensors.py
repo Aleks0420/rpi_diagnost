@@ -140,7 +140,7 @@ def read_rms(chan, offset_voltage, samples=100, scale=1.0):
             read_count += 1
             time.sleep(0.0001)
     except Exception as e:
-        print(f"Error reading current sample on channel {chan.pin}: {e}")
+        print(f"Error reading current sample on channel {str(chan)}: {e}")
         traceback.print_exc()
         return {"error": "read_exception"}
     if read_count == 0:
