@@ -30,7 +30,8 @@ def mpu_processing_and_publish_loop(
         latest_vibration_data_ref,  # Shared dict to store/reflect MPU states and metrics
         latest_temperature_data_ref,
         latest_current_data_ref,
-        is_mqtt_connected_func
+        is_mqtt_connected_func,
+        led_indicator = None
 ):
     print("MPU processing and publishing thread started.")
 
@@ -141,12 +142,25 @@ def mpu_processing_and_publish_loop(
                     flush_if_connected(mqtt_client, mqtt_topic, mqtt_qos, is_mqtt_connected_func)
                     json_payload = json.dumps(payload)
                     mqtt_client.publish(mqtt_topic, json_payload, qos=mqtt_qos)
+                    if led_indicator:
+                        led_indicator.set_yellow(True)
+                        time.sleep(0.05) # Short blink
+                        led_indicator.set_yellow(False)
                 except Exception as e_pub:
                     print(f"Error sending MQTT, save to buffer: {e_pub}")
                     buffer_message(payload)
+                    if led_indicator:
+                         led_indicator.set_red(True) # Indicate buffer error, could also blink
+                         time.sleep(0.1)
+                         led_indicator.set_red(False)
+
             else:
                 print("MQTT disabled, save to buffer.")
                 buffer_message(payload)
+                if led_indicator:
+                    led_indicator.set_red(True) # Indicate buffer error, could also blink
+                    time.sleep(0.1)
+                    led_indicator.set_red(False)
 
             last_publish_time = loop_start_time
 
@@ -176,7 +190,7 @@ def mqtt_watchdog_loop(mqtt_client, config, stop_event, is_connected_func):
     print("MQTT Watchdog thread stopped.")
 
 
-def temperature_thread_loop(temp_sensors_dict, config, stop_event, latest_temperature_data_ref):
+def temperature_thread_loop(temp_sensors_dict, config, stop_event, latest_temperature_data_ref, led_indicator=None):
     """
     Thread function to read temperature sensors periodically and update shared data.
     """
@@ -198,6 +212,14 @@ def temperature_thread_loop(temp_sensors_dict, config, stop_event, latest_temper
             except Exception as e:
                 print(f"Temperature read error for '{name}': {e}")
                 current_reads_this_cycle[name] = {"error": "read_failed", "details": str(e)}
+                if led_indicator:
+                    # Indicate sensor read failure, maybe blink yellow and red
+                    led_indicator.set_yellow(True)
+                    time.sleep(0.05)
+                    led_indicator.set_yellow(False)
+                    led_indicator.set_red(True)
+                    time.sleep(0.05)
+                    led_indicator.set_red(False)
 
         # Update shared data for *all* configured sensors.
         # If a sensor wasn't in temp_sensors_dict (failed init), its state remains as set by init.
@@ -222,7 +244,7 @@ def temperature_thread_loop(temp_sensors_dict, config, stop_event, latest_temper
     print("Temperature thread stopped.")
 
 
-def current_thread_loop(current_sensor_data, config, stop_event, latest_current_data_ref):
+def current_thread_loop(current_sensor_data, config, stop_event, latest_current_data_ref, led_indicator=None):
     """
     Thread function to read current sensors periodically and update shared data.
     current_sensor_data should be the dict returned by initialize_current_sensors.
@@ -279,6 +301,11 @@ def current_thread_loop(current_sensor_data, config, stop_event, latest_current_
             # If a global read error occurs, set read_failed error for all channels that were initialized.
             for name in channel_analogin_map.keys():
                 current_reads_this_cycle[name] = {"error": "read_failed_group", "details": str(e)}
+
+            if led_indicator:
+                led_indicator.set_red(True)  # Red during error
+                time.sleep(0.1)
+                led_indicator.set_red(False)
 
         # Update shared data for *all* configured channels.
         with threading.Lock(): # Assuming latest_current_data_ref is shared
