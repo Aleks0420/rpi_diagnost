@@ -54,6 +54,14 @@ except ImportError:
     print("Error: sensor_processing.py not found. Cannot run application.")
     sys.exit(1)
 
+try:
+    import RPi.GPIO as GPIO
+    from led_indicator import LEDIndicator  # Import the LEDIndicator class
+    LEDS_AVAILABLE = True
+except ImportError:
+    LEDS_AVAILABLE = False
+    print("RPi.GPIO or led_indicator module not found. LED indication disabled.")
+
 
 # --- Global Configuration Dictionary ---
 config = {}
@@ -85,6 +93,9 @@ def signal_handler(signum, frame):
     """Handles signals (like Ctrl+C) to stop the application."""
     print(f"\nSignal {signum} received. Stopping threads...")
     stop_event.set()
+    if LEDS_AVAILABLE:
+       GPIO.cleanup() # To ensure all GPIOs are reset to default state before exiting.
+
 
 
 def pre_populate_error_states(cfg, latest_vib_data, latest_temp_data, latest_curr_data):
@@ -169,8 +180,13 @@ def main():
     mqtt_broker = config.get('mqtt', {}).get('broker', '127.0.0.1')
     mqtt_port = config.get('mqtt', {}).get('port', 1883)
 
+    if LEDS_AVAILABLE:
+        led_indicator = LEDIndicator(green_pin=17, blue_pin=18, yellow_pin=27, red_pin=22, white_pin=23)
+    else:
+        led_indicator = None
+
     mqtt_client = create_mqtt_client(client_id=device_id) # Create client instance
-    connect_mqtt(mqtt_client, mqtt_broker, mqtt_port, device_id, stop_event)
+    connect_mqtt(mqtt_client, mqtt_broker, mqtt_port, device_id, stop_event, led_indicator)
     # connect_mqtt starts loop_start() and handles initial connection attempt.
     # Reconnection will be handled by paho-mqtt's loop.
 
@@ -196,6 +212,10 @@ def main():
     initialized_current_data = initialize_current_sensors(
         current_cfg, latest_current_data, calibrate_flag=current_calibrate_flag
     ) # Returns a dict or None
+
+    if led_indicator:
+       led_indicator.set_white(args.calibrate is True) # True if forced, None defaults to config, but set_white only takes bool
+
 
     # --- 6. Start Sensor Reading and Processing Threads ---
     print("\nStarting sensor processing threads...")
@@ -223,7 +243,8 @@ def main():
                 latest_vibration_data, # To store RMS values
                 latest_temperature_data, # To read for publishing
                 latest_current_data,     # To read for publishing
-                is_mqtt_connected        # Function to check MQTT status
+                is_mqtt_connected,        # Function to check MQTT status
+                led_indicator
             ),
             daemon=True # Daemon threads exit when main program exits
         )
@@ -309,6 +330,9 @@ def main():
         mqtt_client.loop_stop() # Stop the network loop
         mqtt_client.disconnect() # Disconnect
         print("MQTT client stopped.")
+
+    if led_indicator:
+       led_indicator.cleanup()
 
     print("Application finished.")
 

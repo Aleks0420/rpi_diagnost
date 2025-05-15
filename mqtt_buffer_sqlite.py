@@ -72,7 +72,7 @@ def delete_messages(ids):
         conn.close()
 
 
-def flush_if_connected(mqtt_client, topic, qos, is_connected_func):
+def flush_if_connected(mqtt_client, topic, qos, is_connected_func, led_indicator=None):
     """If connected, it sends all messages from the buffer."""
     if not is_connected_func():
         return
@@ -88,6 +88,10 @@ def flush_if_connected(mqtt_client, topic, qos, is_connected_func):
             success_ids.append(msg_id)
         except Exception as e:
             print(f"[Buffer] Error sending buffer message: {e}")
+            if led_indicator:
+                led_indicator.set_red(True)  # Indicate buffer error
+                time.sleep(0.1)
+                led_indicator.set_red(False)
             break
 
     delete_messages(success_ids)

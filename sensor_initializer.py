@@ -95,6 +95,9 @@ def initialize_mpu_sensors(mpu_config_list, latest_vibration_data_ref, calibrate
             print(f"Error initializing MPU6050 '{name}' at bus {bus}, address 0x{address:02x}: {e}")
             traceback.print_exc()
             latest_vibration_data_ref[name] = {"error": "initialization_failed", "details": str(e)}
+            if led_indicator:
+                led_indicator.set_red(True)  # permanent red, critical error
+
 
     return initialized_sensors
 
