@@ -51,19 +51,19 @@
                     "name": "phase_a",
                     "adc_channel": 0,
                     "offset": 0.0,
-                    "scale": 1.0
+                    "scale": 0.9917355371900827
                 },
                 {
                     "name": "phase_b",
                     "adc_channel": 1,
                     "offset": 0.0,
-                    "scale": 1.0
+                    "scale": 1.0169491525423728
                 },
                 {
                     "name": "phase_c",
                     "adc_channel": 2,
                     "offset": 0.0,
-                    "scale": 0.9
+                    "scale": 0.907563025210084
                 }
             ]
         }
