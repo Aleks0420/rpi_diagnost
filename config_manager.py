@@ -423,9 +423,11 @@ def configure_current_channel_offsets(current_config_data):
         print("1. Edit offset/scale for a channel")
         print("2. Set all offsets to zero")
         print("3. Run auto-calibration (no load, updates all offsets)")
+        print("4. Manual calibration - adjust scale using real current measurement")  # NEW option
         print("B. Back to previous menu")
         choice = input("Enter choice: ").strip().upper()
         if choice == '1':
+            # (Existing code for editing individual channel offset/scale)
             try:
                 idx = int(input("Channel number: ")) - 1
                 if 0 <= idx < len(channels):
@@ -442,6 +444,8 @@ def configure_current_channel_offsets(current_config_data):
                             ch['scale'] = float(new_scale)
                         except ValueError:
                             print("Invalid scale")
+                else:
+                    print("Invalid channel number.")
             except Exception:
                 print("Invalid channel number.")
         elif choice == '2':
@@ -454,7 +458,6 @@ def configure_current_channel_offsets(current_config_data):
                 from sensor_initializer import initialize_current_sensors
                 from current_sensors import calibrate_current_sensors, AnalogIn, init_adc
                 fake_data_ref = {}
-                # Re-init ADC and channels
                 result = initialize_current_sensors(current_config_data, fake_data_ref, calibrate_flag=True)
                 if result:
                     offset_map = result['channel_offset_map']
@@ -466,10 +469,59 @@ def configure_current_channel_offsets(current_config_data):
                     print("Calibration failed! Offsets not changed.")
             except Exception as e:
                 print(f"Calibration error: {e}")
+        elif choice == '4':
+            # NEW: Manual calibration for scale adjustment
+            manual_calibrate_current_channels(current_config_data)
         elif choice == 'B':
             break
         else:
             print("Invalid choice.")
+
+
+
+def manual_calibrate_current_channels(current_config_data):
+    """
+    Manual calibration for current sensors.
+    For each channel, prompts the user to input the sensor reading (current reported by the system)
+    and the actual measured current (from a multimeter). Then, calculates and updates the scale factor.
+    """
+    channels = current_config_data.get('channels', [])
+    if not channels:
+        print("No current sensor channels configured.")
+        return
+
+    print("\n--- Manual Calibration for Current Sensors ---")
+    print("For each channel, please input the sensor reading and the actual measured current in Amps.")
+    print("The new scale will be computed as: new_scale = (measured_actual_current / sensor_reading) * old_scale")
+    for idx, ch in enumerate(channels):
+        name = ch.get('name', f"Channel_{idx+1}")
+        old_scale = ch.get('scale', 1.0)
+        try:
+            sensor_reading_str = input(f"\nEnter the sensor reading for '{name}' (value reported by system): ").strip()
+            sensor_reading = float(sensor_reading_str)
+        except ValueError:
+            print("Invalid sensor reading. Skipping this channel.")
+            continue
+
+        try:
+            measured_str = input(f"Enter the actual measured current for '{name}' (in Amps, measured by multimeter): ").strip()
+            measured_current = float(measured_str)
+        except ValueError:
+            print("Invalid measured current value. Skipping this channel.")
+            continue
+
+        if sensor_reading == 0:
+            print("Sensor reading is zero, cannot compute scale factor. Skipping this channel.")
+            continue
+
+        # Calculate new scale factor. The idea is to adjust the scale so that:
+        #    sensor_reading * new_scale = measured_current
+        # Hence, new_scale = (measured_current / sensor_reading) * old_scale
+        new_scale = (measured_current / sensor_reading) * old_scale
+        print(f"Channel '{name}': old scale = {old_scale:.3f}, new scale = {new_scale:.3f}")
+        ch['scale'] = new_scale
+
+    print("Manual calibration complete. New scale factors have been updated in configuration.")
 
 
 def configure_current_sensors_menu(current_config_data):
