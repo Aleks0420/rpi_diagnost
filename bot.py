@@ -1,966 +1,297 @@
-# telegram_bot.py
-# Bot for monitoring and visualization of diagnostics data from InfluxDB/Grafana
 import os
 import time
 import datetime
 import asyncio
-import json
-import requests
+from io import BytesIO
+import matplotlib.pyplot as plt
+import pandas as pd
+from influxdb_client import InfluxDBClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, \
-    MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters
+)
 
-# Configuration
-TELEGRAM_TOKEN = "token"  # Token from BotFather
-GRAFANA_URL = "http://192.168.0.93:3000"  # URL of your Grafana server
-GRAFANA_API_KEY = "YOUR_GRAFANA_API_KEY"  # Grafana API key with viewer permissions
-DASHBOARD_UID = "fel05uc12gdtsc"  # UID of the dashboard from grafana.json
-# DASHBOARD_UID = "eeij2wsy8z11ca"  # UID of the dashboard from grafana.json
-INFLUXDB_URL = "http://192.168.0.93:8086"  # URL of your InfluxDB server
-INFLUXDB_TOKEN = "mXoOpm9EAmECOpkeDDU7CJh56PYtjYoS-oeOrx2F3X3mErSvileOwl6n-8rSXcWC_eXuh2nm3qWdCI5mDwXUzA=="  # InfluxDB access token
-INFLUXDB_ORG = "i"  # Organization in InfluxDB
-INFLUXDB_BUCKET = "eng_bucket"  # Data bucket
+# --- InfluxDB Configuration ---
+INFLUXDB_URL = "http://192.168.0.93:8086"  # URL вашего InfluxDB сервера
+INFLUXDB_TOKEN = ""  # Токен доступа
+INFLUXDB_ORG = "i"  # Организация
+INFLUXDB_BUCKET = "eng_bucket"  # Бакет с данными
 
-# List of user IDs allowed to receive notifications and interact with the bot
-ALLOWED_USER_IDS = [703548391]  # Replace with your Telegram ID
+# --- Telegram Bot Configuration ---
+TELEGRAM_TOKEN = ""
+ALLOWED_USER_IDS = [703548391]  # ID пользователей с доступом
 
-# Threshold values for different types of sensors
-# You can extend this configuration according to your needs
+# --- Thresholds for Alerts ---
 THRESHOLDS = {
-    "vibration": {
-        "total_rms": 2.0,  # g (total RMS vibration value)
-        "rms_x": 1.5,  # g (RMS on X axis)
-        "rms_y": 1.5,  # g (RMS on Y axis)
-        "rms_z": 1.5  # g (RMS on Z axis)
-    },
-    "temperature": {
-        "engine_temp": 80.0,  # °C (engine temperature)
-        "gearbox_temp": 70.0  # °C (gearbox temperature)
-    },
-    "current": {
-        "phase_a": 15.0,  # A (phase A current)
-        "phase_b": 15.0,  # A (phase B current)
-        "phase_c": 15.0  # A (phase C current)
-    }
+    "vibration": {"total_rms": 2.0},
+    "temperature": {"engine_temp": 80.0},
+    "current": {"phase_a": 15.0}
 }
 
-# Check interval in seconds
-CHECK_INTERVAL = 300  # Check every 5 minutes
-
-# States for ConversationHandler
-SELECTING_DEVICE, SELECTING_DATE_RANGE, SELECTING_SENSOR, SETTING_THRESHOLD = range(4)
-
-# Temporary user data cache
-user_data_cache = {}
-
-# Dictionary for tracking sent alerts
-# Structure: {device_id: {sensor_type: {field: last_alert_time}}}
-alert_history = {}
+# --- Conversation States ---
+SELECTING_DEVICE, SELECTING_SENSOR = range(2)
+user_data_cache = {}  # Temporary storage for user selections
 
 
-# Function to load saved threshold values
-def load_thresholds():
-    """Load threshold values from file or return defaults if file not found"""
-    try:
-        with open('thresholds.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # If file not found, use default values
-        return THRESHOLDS
-    except json.JSONDecodeError:
-        print("Error parsing thresholds.json")
-        return THRESHOLDS
+# =============================================
+# InfluxDB Data Fetching Functions
+# =============================================
+
+def query_influx_data(measurement, field, device_id, sensor_name=None, time_range="-1h"):
+    """
+    Query data from InfluxDB and return as DataFrame.
+    Args:
+        measurement: e.g., "vibration_metrics"
+        field: e.g., "total_rms"
+        device_id: e.g., "station_1"
+        sensor_name: Optional (for vibration sensors)
+        time_range: Influx time range syntax (e.g., "-1h")
+    Returns:
+        pandas.DataFrame with '_time' and '_value' columns
+    """
+    query = f'''
+        from(bucket: "{INFLUXDB_BUCKET}")
+          |> range(start: {time_range})
+          |> filter(fn: (r) => r._measurement == "{measurement}")
+          |> filter(fn: (r) => r._field == "{field}")
+          |> filter(fn: (r) => r.device_id == "{device_id}")
+    '''
+    if sensor_name:
+        query += f'|> filter(fn: (r) => r.sensor_name == "{sensor_name}")'
+
+    client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
+    result = client.query_api().query_data_frame(query)
+    client.close()
+
+    # Ensure consistent column names
+    if isinstance(result, list):
+        result = pd.concat(result)
+    return result
 
 
-# Function to save threshold values
-def save_thresholds(thresholds):
-    """Save threshold values to file"""
-    with open('thresholds.json', 'w') as f:
-        json.dump(thresholds, f, indent=2)
+# =============================================
+# Plot Generation Functions
+# =============================================
+
+def generate_time_series_plot(data, title, ylabel, threshold=None):
+    """
+    Generate a matplotlib time series plot from InfluxDB data.
+    Args:
+        data: DataFrame with '_time' and '_value' columns
+        title: Plot title
+        ylabel: Y-axis label
+        threshold: Optional threshold line value
+    Returns:
+        BytesIO buffer with PNG image
+    """
+    plt.figure(figsize=(10, 5))
+
+    # Plot main data
+    plt.plot(data['_time'], data['_value'],
+             label='Data',
+             linewidth=2,
+             color='blue')
+
+    # Add threshold line if provided
+    if threshold is not None:
+        plt.axhline(y=threshold,
+                    color='red',
+                    linestyle='--',
+                    label=f'Threshold ({threshold})')
+
+    plt.title(title)
+    plt.xlabel('Time')
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.legend()
+
+    # Rotate x-axis labels for better readability
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    # Save to buffer
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close()
+    return buf
 
 
-# Load threshold values at startup
-THRESHOLDS = load_thresholds()
+# =============================================
+# Telegram Bot Handlers
+# =============================================
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start interaction with the bot"""
-    user_id = update.effective_user.id
-
-    # Check if user is authorized
-    if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("Sorry, you don't have access to this bot.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command - show device selection menu."""
+    if update.effective_user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("Access denied.")
         return ConversationHandler.END
 
-    user_data_cache[user_id] = {}
+    # Get available devices from InfluxDB
+    devices = ["station_1"]  # In production: query InfluxDB for unique device_id values
 
-    # Get available devices from InfluxDB via Grafana API
-    devices = await get_available_devices()
+    keyboard = [
+        [InlineKeyboardButton(dev, callback_data=f"device_{dev}")]
+        for dev in devices
+    ]
 
-    keyboard = []
-    for device in devices:
-        keyboard.append([InlineKeyboardButton(device, callback_data=f"device_{device}")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Select a device to get data:",
-        reply_markup=reply_markup
+        "Select device:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
     return SELECTING_DEVICE
 
 
-async def get_available_devices():
-    """Get list of available devices from InfluxDB"""
-    try:
-        # Query Grafana API to get list of device_id variable values
-        headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
-        response = requests.get(
-            f"{GRAFANA_URL}/api/datasources/proxy/1/query?db=eng_bucket&q=SHOW+TAG+VALUES+FROM+vibration_metrics+WITH+KEY%3Ddevice_id",
-            headers=headers
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            # Extract device_id values from response
-            devices = [value[1] for series in data.get("results", [{}])[0].get("series", [{}])
-                       for value in series.get("values", [])]
-            return devices or ["station_1"]  # Return default if list is empty
-        return ["station_1"]  # Return default in case of error
-    except Exception as e:
-        print(f"Error getting devices: {e}")
-        return ["station_1"]  # Return default in case of exception
-
-
-async def device_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle device selection"""
+async def device_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle device selection."""
     query = update.callback_query
     await query.answer()
 
-    user_id = update.effective_user.id
-    selected_device = query.data.replace("device_", "")
-    user_data_cache[user_id]["device_id"] = selected_device
+    device_id = query.data.replace("device_", "")
+    user_data_cache[update.effective_user.id] = {"device_id": device_id}
 
-    # Offer to select a time period
+    # Show sensor type selection
     keyboard = [
-        [InlineKeyboardButton("Last hour", callback_data="period_1h")],
-        [InlineKeyboardButton("Last 6 hours", callback_data="period_6h")],
-        [InlineKeyboardButton("Last 24 hours", callback_data="period_24h")],
-        [InlineKeyboardButton("Last 7 days", callback_data="period_7d")],
-        [InlineKeyboardButton("Custom period", callback_data="period_custom")]
+        [InlineKeyboardButton("Vibration", callback_data="sensor_vibration")],
+        [InlineKeyboardButton("Temperature", callback_data="sensor_temp")],
+        [InlineKeyboardButton("Current", callback_data="sensor_current")]
     ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await query.edit_message_text(
-        f"Device: {selected_device}\nSelect data period:",
-        reply_markup=reply_markup
+        f"Device: {device_id}\nSelect sensor type:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-    return SELECTING_DATE_RANGE
-
-
-async def period_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle period selection"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    period = query.data.replace("period_", "")
-
-    if period == "custom":
-        await query.edit_message_text(
-            "Enter period in format: YYYY-MM-DD HH:MM:SS to YYYY-MM-DD HH:MM:SS"
-        )
-        return SELECTING_DATE_RANGE
-
-    user_data_cache[user_id]["period"] = period
-
-    # Get available sensors for selected device
-    sensors = await get_available_sensors(user_data_cache[user_id]["device_id"])
-
-    keyboard = []
-    for sensor in sensors:
-        keyboard.append([InlineKeyboardButton(sensor, callback_data=f"sensor_{sensor}")])
-
-    keyboard.append([InlineKeyboardButton("All graphs", callback_data="sensor_all")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        f"Device: {user_data_cache[user_id]['device_id']}\n"
-        f"Period: {period}\n"
-        f"Select sensor:",
-        reply_markup=reply_markup
-    )
-
     return SELECTING_SENSOR
 
 
-async def get_available_sensors(device_id):
-    """Get list of available sensors for a device"""
-    try:
-        headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
-        response = requests.get(
-            f"{GRAFANA_URL}/api/datasources/proxy/1/query?db=eng_bucket&q=SHOW+TAG+VALUES+FROM+vibration_metrics+WITH+KEY%3Dsensor_name+WHERE+device_id%3D%27{device_id}%27",
-            headers=headers
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            sensors = [value[1] for series in data.get("results", [{}])[0].get("series", [{}])
-                       for value in series.get("values", [])]
-            return sensors or ["engine", "gearbox"]
-        return ["engine", "gearbox"]
-    except Exception as e:
-        print(f"Error getting sensors: {e}")
-        return ["engine", "gearbox"]
-
-
-async def custom_period(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle custom period input"""
-    user_id = update.effective_user.id
-    period_text = update.message.text
-
-    # Simple format check
-    try:
-        parts = period_text.split(" to ")
-        from_time = datetime.datetime.strptime(parts[0].strip(), "%Y-%m-%d %H:%M:%S")
-        to_time = datetime.datetime.strptime(parts[1].strip(), "%Y-%m-%d %H:%M:%S")
-
-        user_data_cache[user_id]["custom_from"] = from_time.isoformat()
-        user_data_cache[user_id]["custom_to"] = to_time.isoformat()
-        user_data_cache[user_id]["period"] = "custom"
-
-        # Get and display list of sensors
-        sensors = await get_available_sensors(user_data_cache[user_id]["device_id"])
-
-        keyboard = []
-        for sensor in sensors:
-            keyboard.append([InlineKeyboardButton(sensor, callback_data=f"sensor_{sensor}")])
-
-        keyboard.append([InlineKeyboardButton("All graphs", callback_data="sensor_all")])
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"Device: {user_data_cache[user_id]['device_id']}\n"
-            f"Period: from {parts[0]} to {parts[1]}\n"
-            f"Select sensor:",
-            reply_markup=reply_markup
-        )
-
-        return SELECTING_SENSOR
-
-    except Exception as e:
-        await update.message.reply_text(
-            "Invalid date format. Please enter period in format: "
-            "YYYY-MM-DD HH:MM:SS to YYYY-MM-DD HH:MM:SS"
-        )
-        return SELECTING_DATE_RANGE
-
-
-async def sensor_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle sensor selection"""
+async def sensor_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle sensor type selection and show data."""
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
-    selected_sensor = query.data.replace("sensor_", "")
-    user_data_cache[user_id]["sensor"] = selected_sensor
+    sensor_type = query.data.replace("sensor_", "")
+    device_id = user_data_cache[user_id]["device_id"]
 
-    await query.edit_message_text("Generating graph, please wait...")
+    await query.edit_message_text("Generating plot...")
 
-    # Get and send graph
-    image = await generate_grafana_image(user_id)
-    if image:
+    # Fetch data and generate appropriate plot
+    if sensor_type == "vibration":
+        data = query_influx_data(
+            measurement="vibration_metrics",
+            field="total_rms",
+            device_id=device_id,
+            sensor_name="engine"  # Or let user select
+        )
+        plot_buf = generate_time_series_plot(
+            data,
+            title=f"Vibration (RMS) - {device_id}",
+            ylabel="Acceleration (g)",
+            threshold=THRESHOLDS["vibration"]["total_rms"]
+        )
+
+    elif sensor_type == "temp":
+        data = query_influx_data(
+            measurement="temperature",
+            field="engine_temp",
+            device_id=device_id
+        )
+        plot_buf = generate_time_series_plot(
+            data,
+            title=f"Temperature - {device_id}",
+            ylabel="Temperature (°C)",
+            threshold=THRESHOLDS["temperature"]["engine_temp"]
+        )
+
+    elif sensor_type == "current":
+        data = query_influx_data(
+            measurement="current",
+            field="phase_a",
+            device_id=device_id
+        )
+        plot_buf = generate_time_series_plot(
+            data,
+            title=f"Current - {device_id}",
+            ylabel="Current (A)",
+            threshold=THRESHOLDS["current"]["phase_a"]
+        )
+
+    # Send the plot
+    if data.empty:
+        await query.edit_message_text("No data available.")
+    else:
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
-            photo=image,
-            caption=f"Graph for device {user_data_cache[user_id]['device_id']}, "
-                    f"sensor: {selected_sensor}, "
-                    f"period: {user_data_cache[user_id]['period']}"
+            photo=plot_buf,
+            caption=f"{sensor_type.capitalize()} data for {device_id}"
         )
-    else:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Error generating graph. Please try again."
-        )
-
-    # Offer to start new request
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="To get a new graph, send /start command"
-    )
 
     return ConversationHandler.END
 
 
-async def generate_grafana_image(user_id):
-    """Generate graph image from Grafana"""
-    try:
-        device_id = user_data_cache[user_id]["device_id"]
-        period = user_data_cache[user_id]["period"]
-        selected_sensor = user_data_cache[user_id]["sensor"]
-
-        # Setup time range
-        if period == "custom":
-            from_time = user_data_cache[user_id]["custom_from"]
-            to_time = user_data_cache[user_id]["custom_to"]
-        else:
-            to_time = int(time.time() * 1000)  # Current time in milliseconds
-
-            # Calculate from_time based on selected period
-            if period == "1h":
-                from_time = to_time - (60 * 60 * 1000)  # -1 hour
-            elif period == "6h":
-                from_time = to_time - (6 * 60 * 60 * 1000)  # -6 hours
-            elif period == "24h":
-                from_time = to_time - (24 * 60 * 60 * 1000)  # -24 hours
-            elif period == "7d":
-                from_time = to_time - (7 * 24 * 60 * 60 * 1000)  # -7 days
-            else:
-                from_time = to_time - (6 * 60 * 60 * 1000)  # Default -6 hours
-
-        # Form URL for panel rendering
-        panel_id = 1  # Default panel ID
-
-        if selected_sensor == "all":
-            # Render entire dashboard
-            render_url = f"{GRAFANA_URL}/render/d/{DASHBOARD_UID}"
-            url_params = {
-                "orgId": 1,
-                "from": from_time,
-                "to": to_time,
-                "var-device_id": device_id,
-                "var-sensor_name": user_data_cache[user_id].get("sensor", "engine"),
-                "width": 1000,
-                "height": 500,
-                "tz": "UTC"
-            }
-        else:
-            # Render specific panel based on selected sensor
-            if selected_sensor in ["engine", "gearbox"]:
-                panel_id = 1  # Total RMS panel
-            elif selected_sensor in ["engine_temp", "gearbox_temp"]:
-                panel_id = 3  # Temperature panel
-            elif selected_sensor in ["phase_a", "phase_b", "phase_c"]:
-                panel_id = 4  # Phase Currents panel
-
-            render_url = f"{GRAFANA_URL}/render/d-solo/{DASHBOARD_UID}"
-            url_params = {
-                "orgId": 1,
-                "from": from_time,
-                "to": to_time,
-                "panelId": panel_id,
-                "var-device_id": device_id,
-                "var-sensor_name": selected_sensor,
-                "width": 800,
-                "height": 400,
-                "tz": "UTC"
-            }
-
-            # Form full URL with parameters
-            param_string = "&".join([f"{k}={v}" for k, v in url_params.items()])
-            full_url = f"{render_url}?{param_string}"
-
-            # Make request to Grafana to get image
-            headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
-            response = requests.get(full_url, headers=headers)
-
-            if response.status_code == 200:
-                return response.content
-            else:
-                print(f"Error rendering Grafana image: {response.status_code}, {response.text}")
-                return None
-
-    except Exception as e:
-        print(f"Error generating Grafana image: {e}")
-        return None
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel operation and end conversation"""
-    await update.message.reply_text(
-        "Operation cancelled. To get a graph, send /start command"
-    )
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the current operation."""
+    await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
-    # Add new command for setting thresholds
 
-async def set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start threshold setting process"""
-    user_id = update.effective_user.id
+# =============================================
+# Alert Checking Function
+# =============================================
 
-    # Check if user is authorized
-    if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("You don't have permission to change threshold values.")
-        return ConversationHandler.END
-
-    user_data_cache[user_id] = {}
-
-    # Get list of available devices
-    devices = await get_available_devices()
-
-    keyboard = []
-    for device in devices:
-        keyboard.append([InlineKeyboardButton(device, callback_data=f"thdev_{device}")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Select device for threshold settings:",
-        reply_markup=reply_markup
-    )
-
-    return SELECTING_DEVICE
-
-async def threshold_device_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle device selection for threshold setting"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    selected_device = query.data.replace("thdev_", "")
-    user_data_cache[user_id]["device_id"] = selected_device
-
-    # Offer to select sensor type for threshold setting
-    keyboard = [
-        [InlineKeyboardButton("Vibration", callback_data="thtype_vibration")],
-        [InlineKeyboardButton("Temperature", callback_data="thtype_temperature")],
-        [InlineKeyboardButton("Current", callback_data="thtype_current")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        f"Device: {selected_device}\nSelect sensor type for threshold setting:",
-        reply_markup=reply_markup
-    )
-
-    return SELECTING_SENSOR
-
-async def threshold_sensor_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle sensor type selection for threshold setting"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    sensor_type = query.data.replace("thtype_", "")
-    user_data_cache[user_id]["sensor_type"] = sensor_type
-
-    # Show current threshold values and offer to select field
-    keyboard = []
-
-    if sensor_type in THRESHOLDS:
-        for field, value in THRESHOLDS[sensor_type].items():
-            keyboard.append([InlineKeyboardButton(f"{field}: {value}", callback_data=f"thfield_{field}")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(
-        f"Device: {user_data_cache[user_id]['device_id']}\n"
-        f"Sensor type: {sensor_type}\n"
-        f"Select field to change threshold value:",
-        reply_markup=reply_markup
-    )
-
-    return SETTING_THRESHOLD
-
-async def threshold_field_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle field selection for threshold setting"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    field = query.data.replace("thfield_", "")
-    user_data_cache[user_id]["field"] = field
-
-    sensor_type = user_data_cache[user_id]["sensor_type"]
-    current_value = THRESHOLDS[sensor_type][field]
-
-    await query.edit_message_text(
-        f"Device: {user_data_cache[user_id]['device_id']}\n"
-        f"Sensor type: {sensor_type}\n"
-        f"Field: {field}\n"
-        f"Current threshold value: {current_value}\n\n"
-        f"Enter new threshold value:"
-    )
-
-    return SETTING_THRESHOLD
-
-async def set_new_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set new threshold value"""
-    user_id = update.effective_user.id
-    new_value_text = update.message.text
-
-    try:
-        new_value = float(new_value_text)
-
-        device_id = user_data_cache[user_id]["device_id"]
-        sensor_type = user_data_cache[user_id]["sensor_type"]
-        field = user_data_cache[user_id]["field"]
-
-        # Update threshold value
-        THRESHOLDS[sensor_type][field] = new_value
-
-        # Save updated thresholds
-        save_thresholds(THRESHOLDS)
-
-        await update.message.reply_text(
-            f"Threshold value updated:\n"
-            f"Device: {device_id}\n"
-            f"Sensor type: {sensor_type}\n"
-            f"Field: {field}\n"
-            f"New value: {new_value}\n\n"
-            f"To set other thresholds, use /set_threshold command"
+async def check_thresholds(context: ContextTypes.DEFAULT_TYPE):
+    """Periodically check thresholds and send alerts."""
+    for user_id in ALLOWED_USER_IDS:
+        # Check vibration
+        vib_data = query_influx_data(
+            measurement="vibration_metrics",
+            field="total_rms",
+            device_id="station_1",
+            time_range="-5m"
         )
 
-        return ConversationHandler.END
+        if not vib_data.empty and vib_data["_value"].iloc[-1] > THRESHOLDS["vibration"]["total_rms"]:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ Vibration threshold exceeded! Current: {vib_data['_value'].iloc[-1]:.2f}g"
+            )
 
-    except ValueError:
-        await update.message.reply_text(
-            "Error: please enter a numeric value.\n"
-            "Try again:"
-        )
-        return SETTING_THRESHOLD
+        # Similar checks for temperature and current...
 
-    # Function to check data and send alerts
 
-async def check_thresholds_and_alert(context: ContextTypes.DEFAULT_TYPE):
-    """Periodically check data for threshold violations"""
-    try:
-        # Get list of devices
-        devices = await get_available_devices()
-
-        for device_id in devices:
-            # Check vibration
-            await check_vibration_thresholds(context, device_id)
-
-            # Check temperature
-            await check_temperature_thresholds(context, device_id)
-
-            # Check current
-            await check_current_thresholds(context, device_id)
-
-    except Exception as e:
-        print(f"Error in threshold checking: {e}")
-
-async def check_vibration_thresholds(context, device_id):
-    """Check vibration threshold values"""
-    try:
-        # Form query to InfluxDB
-        query = f"""
-                    from(bucket: "{INFLUXDB_BUCKET}")
-                      |> range(start: -5m)
-                      |> filter(fn: (r) => r._measurement == "vibration_metrics" and r.device_id == "{device_id}")
-                      |> filter(fn: (r) => r._field == "total_rms" or r._field == "rms_x" or r._field == "rms_y" or r._field == "rms_z")
-                      |> last()
-                    """
-
-        # Execute query via InfluxDB API
-        headers = {
-            "Authorization": f"Token {INFLUXDB_TOKEN}",
-            "Content-Type": "application/vnd.flux"
-        }
-
-        response = requests.post(
-            f"{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}",
-            headers=headers,
-            data=query
-        )
-
-        if response.status_code != 200:
-            print(f"Error querying InfluxDB for vibration: {response.text}")
-            return
-
-        # Process query result
-        # InfluxDB response is in CSV format, so we parse it line by line
-        lines = response.text.strip().split("\n")
-        if len(lines) <= 1:
-            return  # No data
-
-        # Initialize dictionary for device in alert history if it doesn't exist
-        if device_id not in alert_history:
-            alert_history[device_id] = {}
-        if "vibration" not in alert_history[device_id]:
-            alert_history[device_id]["vibration"] = {}
-
-        # Current time for checking alert frequency
-        current_time = time.time()
-
-        # Parse results and check for threshold violations
-        headers = lines[0].split(",")
-        for line in lines[1:]:
-            if line.startswith("#"):
-                continue  # Skip comments
-
-            values = line.split(",")
-            if len(values) < len(headers):
-                continue
-
-            # Convert to dictionary
-            data = {headers[i]: values[i] for i in range(len(headers))}
-
-            # Get field and value
-            field = data.get("_field")
-            value_str = data.get("_value")
-
-            if not field or not value_str:
-                continue
-
-            try:
-                value = float(value_str)
-
-                # Check threshold violation
-                if field in THRESHOLDS["vibration"] and value > THRESHOLDS["vibration"][field]:
-                    # Check if we already sent an alert recently (within the last hour)
-                    last_alert_time = alert_history[device_id]["vibration"].get(field, 0)
-                    if current_time - last_alert_time > 3600:  # 1 hour in seconds
-                        # Send alert
-                        for user_id in ALLOWED_USER_IDS:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=f"⚠️ ALERT! Vibration threshold exceeded!\n"
-                                     f"Device: {device_id}\n"
-                                     f"Parameter: {field}\n"
-                                     f"Value: {value:.4f} (threshold: {THRESHOLDS['vibration'][field]})\n"
-                                     f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                            )
-
-                            # Send graph for visualization
-                            image = await generate_alert_graph(device_id, "vibration", field)
-                            if image:
-                                await context.bot.send_photo(
-                                    chat_id=user_id,
-                                    photo=image,
-                                    caption=f"Graph of {field} for device {device_id}"
-                                )
-
-                        # Update last alert time
-                        alert_history[device_id]["vibration"][field] = current_time
-
-            except ValueError:
-                continue
-
-    except Exception as e:
-        print(f"Error checking vibration thresholds for {device_id}: {e}")
-
-async def check_temperature_thresholds(context, device_id):
-    """Check temperature threshold values"""
-    try:
-        # Form query to InfluxDB
-        query = f"""
-                    from(bucket: "{INFLUXDB_BUCKET}")
-                      |> range(start: -5m)
-                      |> filter(fn: (r) => r._measurement == "temperature" and r.device_id == "{device_id}")
-                      |> filter(fn: (r) => r._field == "engine_temp" or r._field == "gearbox_temp")
-                      |> last()
-                    """
-
-        headers = {
-            "Authorization": f"Token {INFLUXDB_TOKEN}",
-            "Content-Type": "application/vnd.flux"
-        }
-
-        response = requests.post(
-            f"{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}",
-            headers=headers,
-            data=query
-        )
-
-        if response.status_code != 200:
-            print(f"Error querying InfluxDB for temperature: {response.text}")
-            return
-
-        # Process query result
-        lines = response.text.strip().split("\n")
-        if len(lines) <= 1:
-            return  # No data
-
-        # Initialize dictionary for device in alert history
-        if device_id not in alert_history:
-            alert_history[device_id] = {}
-        if "temperature" not in alert_history[device_id]:
-            alert_history[device_id]["temperature"] = {}
-
-        current_time = time.time()
-
-        # Parse results and check for threshold violations
-        headers = lines[0].split(",")
-        for line in lines[1:]:
-            if line.startswith("#"):
-                continue
-
-            values = line.split(",")
-            if len(values) < len(headers):
-                continue
-
-            data = {headers[i]: values[i] for i in range(len(headers))}
-
-            field = data.get("_field")
-            value_str = data.get("_value")
-
-            if not field or not value_str:
-                continue
-
-            try:
-                value = float(value_str)
-
-                if field in THRESHOLDS["temperature"] and value > THRESHOLDS["temperature"][field]:
-                    last_alert_time = alert_history[device_id]["temperature"].get(field, 0)
-                    if current_time - last_alert_time > 3600:  # 1 hour
-                        # Send alert
-                        for user_id in ALLOWED_USER_IDS:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=f"🔥 ALERT! Temperature threshold exceeded!\n"
-                                     f"Device: {device_id}\n"
-                                     f"Sensor: {field}\n"
-                                     f"Value: {value:.1f}°C (threshold: {THRESHOLDS['temperature'][field]}°C)\n"
-                                     f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                            )
-
-                            # Send graph
-                            image = await generate_alert_graph(device_id, "temperature", field)
-                            if image:
-                                await context.bot.send_photo(
-                                    chat_id=user_id,
-                                    photo=image,
-                                    caption=f"Temperature graph of {field} for device {device_id}"
-                                )
-
-                        # Update last alert time
-                        alert_history[device_id]["temperature"][field] = current_time
-
-            except ValueError:
-                continue
-
-    except Exception as e:
-        print(f"Error checking temperature thresholds for {device_id}: {e}")
-
-async def check_current_thresholds(context, device_id):
-    """Check current threshold values"""
-    try:
-        # Form query to InfluxDB
-        query = f"""
-                from(bucket: "{INFLUXDB_BUCKET}")
-                  |> range(start: -5m)
-                  |> filter(fn: (r) => r._measurement == "current" and r.device_id == "{device_id}")
-                  |> filter(fn: (r) => r._field == "phase_a" or r._field == "phase_b" or r._field == "phase_c")
-                  |> last()
-                """
-
-        headers = {
-            "Authorization": f"Token {INFLUXDB_TOKEN}",
-            "Content-Type": "application/vnd.flux"
-        }
-
-        response = requests.post(
-            f"{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}",
-            headers=headers,
-            data=query
-        )
-
-        if response.status_code != 200:
-            print(f"Error querying InfluxDB for current: {response.text}")
-            return
-
-        # Process query result
-        lines = response.text.strip().split("\n")
-        if len(lines) <= 1:
-            return  # No data
-
-        # Initialize dictionary for device in alert history
-        if device_id not in alert_history:
-            alert_history[device_id] = {}
-        if "current" not in alert_history[device_id]:
-            alert_history[device_id]["current"] = {}
-
-        current_time = time.time()
-
-        # Parse results and check for threshold violations
-        headers = lines[0].split(",")
-        for line in lines[1:]:
-            if line.startswith("#"):
-                continue
-
-            values = line.split(",")
-            if len(values) < len(headers):
-                continue
-
-            data = {headers[i]: values[i] for i in range(len(headers))}
-
-            field = data.get("_field")
-            value_str = data.get("_value")
-
-            if not field or not value_str:
-                continue
-
-            try:
-                value = float(value_str)
-
-                if field in THRESHOLDS["current"] and value > THRESHOLDS["current"][field]:
-                    last_alert_time = alert_history[device_id]["current"].get(field, 0)
-                    if current_time - last_alert_time > 3600:  # 1 hour
-                        # Send alert
-                        for user_id in ALLOWED_USER_IDS:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=f"⚡ ALERT! Current threshold exceeded!\n"
-                                     f"Device: {device_id}\n"
-                                     f"Phase: {field}\n"
-                                     f"Value: {value:.2f}A (threshold: {THRESHOLDS['current'][field]}A)\n"
-                                     f"Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                            )
-
-                            # Send graph
-                            image = await generate_alert_graph(device_id, "current", field)
-                            if image:
-                                await context.bot.send_photo(
-                                    chat_id=user_id,
-                                    photo=image,
-                                    caption=f"Current graph of {field} for device {device_id}"
-                                )
-
-                        # Update last alert time
-                        alert_history[device_id]["current"][field] = current_time
-
-            except ValueError:
-                continue
-
-    except Exception as e:
-        print(f"Error checking current thresholds for {device_id}: {e}")
-
-async def generate_alert_graph(device_id, measurement_type, field):
-    """Generate graph for threshold violation alert"""
-    try:
-        # Define parameters for Grafana graph request
-        panel_id = 1  # Default panel ID
-
-        if measurement_type == "vibration":
-            panel_id = 1 if field == "total_rms" else 2  # Use RMS X/Y/Z panel for other fields
-        elif measurement_type == "temperature":
-            panel_id = 3  # Temperature panel
-        elif measurement_type == "current":
-            panel_id = 4  # Phase Currents panel
-
-        # Form URL for panel rendering
-        render_url = f"{GRAFANA_URL}/render/d-solo/{DASHBOARD_UID}"
-
-        # Current time in milliseconds for Grafana
-        to_time = int(time.time() * 1000)
-        from_time = to_time - (3 * 60 * 60 * 1000)  # -3 hours
-
-        url_params = {
-            "orgId": 1,
-            "from": from_time,
-            "to": to_time,
-            "panelId": panel_id,
-            "var-device_id": device_id,
-            "var-sensor_name": field.split("_")[0] if "_" in field else field,  # Approximate matching
-            "width": 800,
-            "height": 400,
-            "tz": "UTC"
-        }
-
-        # Form full URL with parameters
-        param_string = "&".join([f"{k}={v}" for k, v in url_params.items()])
-        full_url = f"{render_url}?{param_string}"
-
-        # Make request to Grafana to get image
-        headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
-        response = requests.get(full_url, headers=headers)
-
-        if response.status_code == 200:
-            return response.content
-        else:
-            print(f"Error rendering Grafana image for alert: {response.status_code}, {response.text}")
-            return None
-
-    except Exception as e:
-        print(f"Error generating alert graph: {e}")
-        return None
-
-    # Command to view current thresholds
-
-async def show_thresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Display current threshold values"""
-    user_id = update.effective_user.id
-
-    # Check if user is authorized
-    if user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("You don't have permission to view threshold values.")
-        return
-
-    # Form message with current thresholds
-    message = "📊 Current threshold values:\n\n"
-
-    # Vibration
-    message += "🔵 Vibration:\n"
-    for field, value in THRESHOLDS["vibration"].items():
-        message += f"  • {field}: {value} g\n"
-
-    # Temperature
-    message += "\n🔴 Temperature:\n"
-    for field, value in THRESHOLDS["temperature"].items():
-        message += f"  • {field}: {value}°C\n"
-
-    # Current
-    message += "\n⚡ Current:\n"
-    for field, value in THRESHOLDS["current"].items():
-        message += f"  • {field}: {value}A\n"
-
-    message += "\nTo change thresholds, use /set_threshold command"
-
-    await update.message.reply_text(message)
+# =============================================
+# Main Application Setup
+# =============================================
 
 def main():
-    """Main function to start the bot"""
-    # Create application
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    """Start the bot."""
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Configure command handlers
+    # Conversation handler for data selection
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            SELECTING_DEVICE: [
-                CallbackQueryHandler(device_selected, pattern=r"^device_")
-            ],
-            SELECTING_DATE_RANGE: [
-                CallbackQueryHandler(period_selected, pattern=r"^period_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_period)
-            ],
-            SELECTING_SENSOR: [
-                CallbackQueryHandler(sensor_selected, pattern=r"^sensor_")
-            ],
+            SELECTING_DEVICE: [CallbackQueryHandler(device_selected, pattern=r"^device_")],
+            SELECTING_SENSOR: [CallbackQueryHandler(sensor_selected, pattern=r"^sensor_")]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
 
-    # Handler for threshold settings
-    threshold_handler = ConversationHandler(
-        entry_points=[CommandHandler("set_threshold", set_threshold)],
-        states={
-            SELECTING_DEVICE: [
-                CallbackQueryHandler(threshold_device_selected, pattern=r"^thdev_")
-            ],
-            SELECTING_SENSOR: [
-                CallbackQueryHandler(threshold_sensor_type_selected, pattern=r"^thtype_")
-            ],
-            SETTING_THRESHOLD: [
-                CallbackQueryHandler(threshold_field_selected, pattern=r"^thfield_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_new_threshold)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    app.add_handler(conv_handler)
 
-    # Add handlers
-    application.add_handler(conv_handler)
-    application.add_handler(threshold_handler)
-    application.add_handler(CommandHandler("show_thresholds", show_thresholds))
+    # Add periodic threshold checking
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_thresholds, interval=300.0, first=10)
 
-    # Start periodic threshold checking task
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_thresholds_and_alert, interval=CHECK_INTERVAL, first=10)
+    print("Bot started")
+    app.run_polling()
 
-    # Start the bot
-    print(f"Telegram bot started. Checking thresholds every {CHECK_INTERVAL} seconds.")
-    application.run_polling()
 
 if __name__ == "__main__":
     main()
