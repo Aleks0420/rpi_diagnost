@@ -11,7 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
     MessageHandler, filters
 
 # Configuration
-TELEGRAM_TOKEN = "7882919864:AAH9wV2YYW625b9RsQPrzl87wpv8cgPFWVA"  # Token from BotFather
+TELEGRAM_TOKEN = "token"  # Token from BotFather
 GRAFANA_URL = "http://192.168.0.93:3000"  # URL of your Grafana server
 GRAFANA_API_KEY = "YOUR_GRAFANA_API_KEY"  # Grafana API key with viewer permissions
 DASHBOARD_UID = "fel05uc12gdtsc"  # UID of the dashboard from grafana.json
