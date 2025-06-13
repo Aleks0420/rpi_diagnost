@@ -12,20 +12,18 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters
+    ConversationHandler
 )
 
 # --- InfluxDB Configuration ---
-INFLUXDB_URL = "http://192.168.0.93:8086"  # URL вашего InfluxDB сервера
-INFLUXDB_TOKEN = ""  # Токен доступа
-INFLUXDB_ORG = "i"  # Организация
-INFLUXDB_BUCKET = "eng_bucket"  # Бакет с данными
+INFLUXDB_URL = "http://192.168.0.93:8086"
+INFLUXDB_TOKEN = ""  # Access token
+INFLUXDB_ORG = "i"  # Organization
+INFLUXDB_BUCKET = "eng_bucket"  # Data bucket
 
 # --- Telegram Bot Configuration ---
 TELEGRAM_TOKEN = ""
-ALLOWED_USER_IDS = [703548391]  # ID пользователей с доступом
+ALLOWED_USER_IDS = [703548391]  # Allowed user IDs
 
 # --- Thresholds for Alerts ---
 THRESHOLDS = {
@@ -34,9 +32,9 @@ THRESHOLDS = {
     "current": {"phase_a": 15.0}
 }
 
-# --- Conversation States ---
-SELECTING_DEVICE, SELECTING_SENSOR = range(2)
-user_data_cache = {}  # Temporary storage for user selections
+# --- States for Conversation ---
+SELECTING_DEVICE, SELECTING_SENSORS, SELECTING_RANGE = range(3)
+user_data_cache = {}  # Cache for user selections
 
 
 # =============================================
@@ -79,31 +77,31 @@ def query_influx_data(measurement, field, device_id, sensor_name=None, time_rang
 # Plot Generation Functions
 # =============================================
 
-def generate_time_series_plot(data, title, ylabel, threshold=None):
+def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
     """
-    Generate a matplotlib time series plot from InfluxDB data.
+    Generate a matplotlib plot for multiple sensors.
     Args:
-        data: DataFrame with '_time' and '_value' columns
-        title: Plot title
-        ylabel: Y-axis label
-        threshold: Optional threshold line value
+        data_dict: Dictionary where keys are sensor names and values are DataFrames.
+        title: Plot title.
+        ylabel: Y-axis label.
+        thresholds: Optional dictionary of thresholds for each sensor.
     Returns:
-        BytesIO buffer with PNG image
+        BytesIO buffer with PNG image.
     """
-    plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(12, 6))
 
-    # Plot main data
-    plt.plot(data['_time'], data['_value'],
-             label='Data',
-             linewidth=2,
-             color='blue')
+    colors = plt.cm.get_cmap("tab10")  # Use matplotlib's colormap for different colors
 
-    # Add threshold line if provided
-    if threshold is not None:
-        plt.axhline(y=threshold,
-                    color='red',
-                    linestyle='--',
-                    label=f'Threshold ({threshold})')
+    for i, (sensor_name, data) in enumerate(data_dict.items()):
+        if data.empty:
+            continue
+        plt.plot(data['_time'], data['_value'], label=sensor_name, color=colors(i))
+
+        if thresholds and sensor_name in thresholds:
+            plt.axhline(y=thresholds[sensor_name],
+                        color=colors(i),
+                        linestyle='--',
+                        label=f"{sensor_name} Threshold ({thresholds[sensor_name]})")
 
     plt.title(title)
     plt.xlabel('Time')
@@ -156,80 +154,113 @@ async def device_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     device_id = query.data.replace("device_", "")
     user_data_cache[update.effective_user.id] = {"device_id": device_id}
 
-    # Show sensor type selection
+    # Show sensor selection menu
     keyboard = [
         [InlineKeyboardButton("Vibration", callback_data="sensor_vibration")],
         [InlineKeyboardButton("Temperature", callback_data="sensor_temp")],
-        [InlineKeyboardButton("Current", callback_data="sensor_current")]
+        [InlineKeyboardButton("Current", callback_data="sensor_current")],
+        [InlineKeyboardButton("All Sensors", callback_data="sensor_all")]
     ]
 
     await query.edit_message_text(
-        f"Device: {device_id}\nSelect sensor type:",
+        f"Device: {device_id}\nSelect sensor group:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    return SELECTING_SENSOR
+    return SELECTING_SENSORS
 
 
-async def sensor_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle sensor type selection and show data."""
+async def sensors_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle sensor group selection and show time range options."""
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
-    sensor_type = query.data.replace("sensor_", "")
+    sensor_group = query.data.replace("sensor_", "")
+    user_data_cache[user_id]["sensor_group"] = sensor_group
+
+    # Show time range selection
+    keyboard = [
+        [InlineKeyboardButton("Last 1 hour", callback_data="range_-1h")],
+        [InlineKeyboardButton("Last 24 hours", callback_data="range_-24h")],
+        [InlineKeyboardButton("Last 7 days", callback_data="range_-7d")],
+        [InlineKeyboardButton("Custom range", callback_data="range_custom")]  # Custom range not implemented yet
+    ]
+
+    await query.edit_message_text(
+        f"Sensor group: {sensor_group}\nSelect time range:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SELECTING_RANGE
+
+
+async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle time range selection and generate plot."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    time_range = query.data.replace("range_", "")
+    user_data_cache[user_id]["time_range"] = time_range
+
     device_id = user_data_cache[user_id]["device_id"]
+    sensor_group = user_data_cache[user_id]["sensor_group"]
 
     await query.edit_message_text("Generating plot...")
 
-    # Fetch data and generate appropriate plot
-    if sensor_type == "vibration":
-        data = query_influx_data(
-            measurement="vibration_metrics",
-            field="total_rms",
-            device_id=device_id,
-            sensor_name="engine"  # Or let user select
-        )
-        plot_buf = generate_time_series_plot(
-            data,
-            title=f"Vibration (RMS) - {device_id}",
-            ylabel="Acceleration (g)",
-            threshold=THRESHOLDS["vibration"]["total_rms"]
-        )
+    # Fetch data for selected sensors
+    data_dict = {}
+    thresholds = {}
 
-    elif sensor_type == "temp":
-        data = query_influx_data(
-            measurement="temperature",
-            field="engine_temp",
-            device_id=device_id
-        )
-        plot_buf = generate_time_series_plot(
-            data,
-            title=f"Temperature - {device_id}",
-            ylabel="Temperature (°C)",
-            threshold=THRESHOLDS["temperature"]["engine_temp"]
-        )
+    if sensor_group in ["vibration", "all"]:
+        for sensor_name in ["engine", "gearbox"]:  # Example vibration sensors
+            data = query_influx_data(
+                measurement="vibration_metrics",
+                field="total_rms",
+                device_id=device_id,
+                sensor_name=sensor_name,
+                time_range=time_range
+            )
+            data_dict[sensor_name] = data
+            thresholds[sensor_name] = THRESHOLDS["vibration"]["total_rms"]
 
-    elif sensor_type == "current":
-        data = query_influx_data(
-            measurement="current",
-            field="phase_a",
-            device_id=device_id
-        )
-        plot_buf = generate_time_series_plot(
-            data,
-            title=f"Current - {device_id}",
-            ylabel="Current (A)",
-            threshold=THRESHOLDS["current"]["phase_a"]
-        )
+    if sensor_group in ["temperature", "all"]:
+        for sensor_name in ["engine_temp", "gearbox_temp"]:
+            data = query_influx_data(
+                measurement="temperature",
+                field=sensor_name,
+                device_id=device_id,
+                time_range=time_range
+            )
+            data_dict[sensor_name] = data
+            thresholds[sensor_name] = THRESHOLDS["temperature"]["engine_temp"]
+
+    if sensor_group in ["current", "all"]:
+        for sensor_name in ["phase_a", "phase_b", "phase_c"]:
+            data = query_influx_data(
+                measurement="current",
+                field=sensor_name,
+                device_id=device_id,
+                time_range=time_range
+            )
+            data_dict[sensor_name] = data
+            thresholds[sensor_name] = THRESHOLDS["current"]["phase_a"]
+
+    # Generate plot
+    plot_buf = generate_multi_sensor_plot(
+        data_dict,
+        title=f"{sensor_group.capitalize()} Data - {device_id}",
+        ylabel="Value",
+        thresholds=thresholds
+    )
 
     # Send the plot
-    if data.empty:
+    if not any(not data.empty for data in data_dict.values()):
         await query.edit_message_text("No data available.")
     else:
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=plot_buf,
-            caption=f"{sensor_type.capitalize()} data for {device_id}"
+            caption=f"{sensor_group.capitalize()} data for {device_id} (Range: {time_range})"
         )
 
     return ConversationHandler.END
@@ -239,30 +270,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the current operation."""
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
-
-
-# =============================================
-# Alert Checking Function
-# =============================================
-
-async def check_thresholds(context: ContextTypes.DEFAULT_TYPE):
-    """Periodically check thresholds and send alerts."""
-    for user_id in ALLOWED_USER_IDS:
-        # Check vibration
-        vib_data = query_influx_data(
-            measurement="vibration_metrics",
-            field="total_rms",
-            device_id="station_1",
-            time_range="-5m"
-        )
-
-        if not vib_data.empty and vib_data["_value"].iloc[-1] > THRESHOLDS["vibration"]["total_rms"]:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⚠️ Vibration threshold exceeded! Current: {vib_data['_value'].iloc[-1]:.2f}g"
-            )
-
-        # Similar checks for temperature and current...
 
 
 # =============================================
@@ -278,16 +285,13 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             SELECTING_DEVICE: [CallbackQueryHandler(device_selected, pattern=r"^device_")],
-            SELECTING_SENSOR: [CallbackQueryHandler(sensor_selected, pattern=r"^sensor_")]
+            SELECTING_SENSORS: [CallbackQueryHandler(sensors_selected, pattern=r"^sensor_")],
+            SELECTING_RANGE: [CallbackQueryHandler(range_selected, pattern=r"^range_")]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
 
     app.add_handler(conv_handler)
-
-    # Add periodic threshold checking
-    job_queue = app.job_queue
-    job_queue.run_repeating(check_thresholds, interval=300.0, first=10)
 
     print("Bot started")
     app.run_polling()
