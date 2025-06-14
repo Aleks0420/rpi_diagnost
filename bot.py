@@ -92,10 +92,12 @@ def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
 
     colors = plt.cm.get_cmap("tab10")  # Use matplotlib's colormap for different colors
 
+    has_plot_elements = False
     for i, (sensor_name, data) in enumerate(data_dict.items()):
         if data.empty:
             continue
         plt.plot(data['_time'], data['_value'], label=sensor_name, color=colors(i))
+        has_plot_elements = True  # Отмечаем, что добавили элемент на график
 
         if thresholds and sensor_name in thresholds:
             plt.axhline(y=thresholds[sensor_name],
@@ -107,7 +109,8 @@ def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
     plt.xlabel('Time')
     plt.ylabel(ylabel)
     plt.grid(True)
-    plt.legend()
+    if has_plot_elements:
+        plt.legend()
 
     # Rotate x-axis labels for better readability
     plt.xticks(rotation=45)
@@ -223,16 +226,18 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data_dict[sensor_name] = data
             thresholds[sensor_name] = THRESHOLDS["vibration"]["total_rms"]
 
-    if sensor_group in ["temperature", "all"]:
-        for sensor_name in ["engine_temp", "gearbox_temp"]:
+    if sensor_group in ["temp", "temperature", "all"]:
+        temp_fields = ["engine_temp", "gearbox_temp"]  # Все возможные поля температуры
+        for field in temp_fields:
             data = query_influx_data(
                 measurement="temperature",
-                field=sensor_name,
+                field=field,
                 device_id=device_id,
                 time_range=time_range
             )
-            data_dict[sensor_name] = data
-            thresholds[sensor_name] = THRESHOLDS["temperature"]["engine_temp"]
+            if not data.empty:
+                data_dict[field] = data
+                thresholds[field] = THRESHOLDS["temperature"]["engine_temp"]  # Используем общий порог
 
     if sensor_group in ["current", "all"]:
         for sensor_name in ["phase_a", "phase_b", "phase_c"]:
