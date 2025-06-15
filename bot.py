@@ -27,9 +27,9 @@ ALLOWED_USER_IDS = [703548391]  # Allowed user IDs
 
 # --- Thresholds for Alerts ---
 THRESHOLDS = {
-    "vibration": {"total_rms": 2.0},
+    "vibration": {"total_rms": 1.25},
     "temperature": {"engine_temp": 80.0},
-    "current": {"phase_a": 15.0}
+    "current": {"phase_a": 8.0}
 }
 
 # --- States for Conversation ---
@@ -197,7 +197,7 @@ async def sensors_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle time range selection and generate plot."""
+    """Handle time range selection and generate plot(s)."""
     query = update.callback_query
     await query.answer()
 
@@ -208,13 +208,27 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     device_id = user_data_cache[user_id]["device_id"]
     sensor_group = user_data_cache[user_id]["sensor_group"]
 
-    await query.edit_message_text("Generating plot...")
+    await query.edit_message_text("Generating plot(s)...")
 
-    # Fetch data for selected sensors
+    if sensor_group == "all":
+        # Generate and send separate plots for each sensor group
+        await generate_and_send_plot(update, context, device_id, "vibration", time_range)
+        await generate_and_send_plot(update, context, device_id, "temperature", time_range)
+        await generate_and_send_plot(update, context, device_id, "current", time_range)
+
+    else:
+        # Generate and send plot for the selected sensor group
+        await generate_and_send_plot(update, context, device_id, sensor_group, time_range)
+
+    return ConversationHandler.END
+
+
+async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group, time_range):
+    """Generates plot for a specific sensor group and sends it to the user."""
     data_dict = {}
     thresholds = {}
 
-    if sensor_group in ["vibration", "all"]:
+    if sensor_group == "vibration":
         for sensor_name in ["engine", "gearbox"]:  # Example vibration sensors
             data = query_influx_data(
                 measurement="vibration_metrics",
@@ -226,7 +240,7 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data_dict[sensor_name] = data
             thresholds[sensor_name] = THRESHOLDS["vibration"]["total_rms"]
 
-    if sensor_group in ["temp", "temperature", "all"]:
+    elif sensor_group in ["temp", "temperature"]: #  or sensor_group == "temperature": # Исправлено здесь
         temp_fields = ["engine_temp", "gearbox_temp"]  # Все возможные поля температуры
         for field in temp_fields:
             data = query_influx_data(
@@ -239,7 +253,7 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data_dict[field] = data
                 thresholds[field] = THRESHOLDS["temperature"]["engine_temp"]  # Используем общий порог
 
-    if sensor_group in ["current", "all"]:
+    elif sensor_group == "current":
         for sensor_name in ["phase_a", "phase_b", "phase_c"]:
             data = query_influx_data(
                 measurement="current",
@@ -260,15 +274,16 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send the plot
     if not any(not data.empty for data in data_dict.values()):
-        await query.edit_message_text("No data available.")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"No data available for {sensor_group}."
+        )
     else:
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=plot_buf,
             caption=f"{sensor_group.capitalize()} data for {device_id} (Range: {time_range})"
         )
-
-    return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
