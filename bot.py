@@ -12,17 +12,19 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler
+    ConversationHandler,
+    MessageHandler,
+    filters
 )
 
 # --- InfluxDB Configuration ---
 INFLUXDB_URL = "http://192.168.0.93:8086"
-INFLUXDB_TOKEN = ""  # Access token
+INFLUXDB_TOKEN = "mXoOpm9EAmECOpkeDDU7CJh56PYtjYoS-oeOrx2F3X3mErSvileOwl6n-8rSXcWC_eXuh2nm3qWdCI5mDwXUzA=="  # Access token
 INFLUXDB_ORG = "i"  # Organization
 INFLUXDB_BUCKET = "eng_bucket"  # Data bucket
 
 # --- Telegram Bot Configuration ---
-TELEGRAM_TOKEN = ""
+TELEGRAM_TOKEN = "7882919864:AAH9wV2YYW625b9RsQPrzl87wpv8cgPFWVA"
 ALLOWED_USER_IDS = [703548391]  # Allowed user IDs
 
 # --- Thresholds for Alerts ---
@@ -33,7 +35,7 @@ THRESHOLDS = {
 }
 
 # --- States for Conversation ---
-SELECTING_DEVICE, SELECTING_SENSORS, SELECTING_RANGE = range(3)
+SELECTING_DEVICE, SELECTING_SENSORS, SELECTING_RANGE, ENTERING_START_DATE, ENTERING_START_TIME, ENTERING_END_DATE, ENTERING_END_TIME = range(7)
 user_data_cache = {}  # Cache for user selections
 
 
@@ -49,13 +51,23 @@ def query_influx_data(measurement, field, device_id, sensor_name=None, time_rang
         field: e.g., "total_rms"
         device_id: e.g., "station_1"
         sensor_name: Optional (for vibration sensors)
-        time_range: Influx time range syntax (e.g., "-1h")
+        time_range: Influx time range syntax (e.g., "-1h" or {"start": "2023-01-01T00:00:00Z", "stop": "2023-01-02T00:00:00Z"})
     Returns:
         pandas.DataFrame with '_time' and '_value' columns
     """
+    # Проверяем, является ли time_range словарем с custom range
+    if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
+        range_clause = f'range(start: {time_range["start"]}, stop: {time_range["stop"]})'
+    # Проверяем, содержит ли time_range уже готовую строку с range
+    elif isinstance(time_range, str) and time_range.startswith("range("):
+        range_clause = time_range
+    # Стандартный случай с относительным временем (-1h, -24h, -7d)
+    else:
+        range_clause = f'range(start: {time_range})'
+
     query = f'''
         from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: {time_range})
+          |> {range_clause}
           |> filter(fn: (r) => r._measurement == "{measurement}")
           |> filter(fn: (r) => r._field == "{field}")
           |> filter(fn: (r) => r.device_id == "{device_id}")
@@ -186,7 +198,7 @@ async def sensors_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Last 1 hour", callback_data="range_-1h")],
         [InlineKeyboardButton("Last 24 hours", callback_data="range_-24h")],
         [InlineKeyboardButton("Last 7 days", callback_data="range_-7d")],
-        [InlineKeyboardButton("Custom range", callback_data="range_custom")]  # Custom range not implemented yet
+        [InlineKeyboardButton("Custom range", callback_data="range_custom")]
     ]
 
     await query.edit_message_text(
@@ -197,14 +209,22 @@ async def sensors_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle time range selection and generate plot(s)."""
+    """Handle time range selection and generate plot(s) or request custom range."""
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
     time_range = query.data.replace("range_", "")
-    user_data_cache[user_id]["time_range"] = time_range
 
+    # If custom range is selected, ask for start date
+    if time_range == "custom":
+        await query.edit_message_text(
+            "Please enter the start date in format YYYY-MM-DD:"
+        )
+        return ENTERING_START_DATE
+
+    # For predefined ranges, proceed as before
+    user_data_cache[user_id]["time_range"] = time_range
     device_id = user_data_cache[user_id]["device_id"]
     sensor_group = user_data_cache[user_id]["sensor_group"]
 
@@ -215,7 +235,6 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await generate_and_send_plot(update, context, device_id, "vibration", time_range)
         await generate_and_send_plot(update, context, device_id, "temperature", time_range)
         await generate_and_send_plot(update, context, device_id, "current", time_range)
-
     else:
         # Generate and send plot for the selected sensor group
         await generate_and_send_plot(update, context, device_id, sensor_group, time_range)
@@ -223,7 +242,115 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group, time_range):
+async def enter_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the input of the start date for custom range."""
+    user_id = update.effective_user.id
+    start_date = update.message.text
+
+    # Validate date format
+    try:
+        datetime.datetime.strptime(start_date, "%Y-%m-%d")
+        user_data_cache[user_id]["start_date"] = start_date
+
+        await update.message.reply_text(
+            "Please enter the start time in format HH:MM:"
+        )
+        return ENTERING_START_TIME
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid date format. Please enter the start date in format YYYY-MM-DD:"
+        )
+        return ENTERING_START_DATE
+
+
+async def enter_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the input of the start time for custom range."""
+    user_id = update.effective_user.id
+    start_time = update.message.text
+
+    # Validate time format
+    try:
+        datetime.datetime.strptime(start_time, "%H:%M")
+        user_data_cache[user_id]["start_time"] = start_time
+
+        await update.message.reply_text(
+            "Please enter the end date in format YYYY-MM-DD:"
+        )
+        return ENTERING_END_DATE
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid time format. Please enter the start time in format HH:MM:"
+        )
+        return ENTERING_START_TIME
+
+
+async def enter_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the input of the end date for custom range."""
+    user_id = update.effective_user.id
+    end_date = update.message.text
+
+    # Validate date format
+    try:
+        datetime.datetime.strptime(end_date, "%Y-%m-%d")
+        user_data_cache[user_id]["end_date"] = end_date
+
+        await update.message.reply_text(
+            "Please enter the end time in format HH:MM:"
+        )
+        return ENTERING_END_TIME
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid date format. Please enter the end date in format YYYY-MM-DD:"
+        )
+        return ENTERING_END_DATE
+
+
+async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the input of the end time and generate plots with custom range."""
+    user_id = update.effective_user.id
+    end_time = update.message.text
+
+    # Validate time format
+    try:
+        datetime.datetime.strptime(end_time, "%H:%M")
+        user_data_cache[user_id]["end_time"] = end_time
+
+        # Construct the time range object for InfluxDB
+        start_datetime = f"{user_data_cache[user_id]['start_date']}T{user_data_cache[user_id]['start_time']}:00Z"
+        end_datetime = f"{user_data_cache[user_id]['end_date']}T{user_data_cache[user_id]['end_time']}:00Z"
+
+        # Создаем словарь с параметрами диапазона вместо строки
+        time_range = {
+            "start": start_datetime,
+            "stop": end_datetime
+        }
+
+        user_data_cache[user_id]["time_range"] = time_range
+
+        device_id = user_data_cache[user_id]["device_id"]
+        sensor_group = user_data_cache[user_id]["sensor_group"]
+
+        await update.message.reply_text("Generating plot(s)...")
+
+        if sensor_group == "all":
+            # Generate and send separate plots for each sensor group
+            await generate_and_send_plot(update, context, device_id, "vibration", time_range)
+            await generate_and_send_plot(update, context, device_id, "temperature", time_range)
+            await generate_and_send_plot(update, context, device_id, "current", time_range)
+        else:
+            # Generate and send plot for the selected sensor group
+            await generate_and_send_plot(update, context, device_id, sensor_group, time_range)
+
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid time format. Please enter the end time in format HH:MM:"
+        )
+        return ENTERING_END_TIME
+
+
+async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group,
+                                 time_range):
     """Generates plot for a specific sensor group and sends it to the user."""
     data_dict = {}
     thresholds = {}
@@ -240,7 +367,7 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             data_dict[sensor_name] = data
             thresholds[sensor_name] = THRESHOLDS["vibration"]["total_rms"]
 
-    elif sensor_group in ["temp", "temperature"]: #  or sensor_group == "temperature": # Исправлено здесь
+    elif sensor_group in ["temp", "temperature"]:
         temp_fields = ["engine_temp", "gearbox_temp"]  # Все возможные поля температуры
         for field in temp_fields:
             data = query_influx_data(
@@ -279,10 +406,20 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             text=f"No data available for {sensor_group}."
         )
     else:
+        # Форматируем диапазон для отображения
+        display_range = time_range
+        if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
+            # Для пользовательского диапазона отображаем более читаемый формат
+            start_time = time_range["start"].replace("Z", "")
+            end_time = time_range["stop"].replace("Z", "")
+            display_range = f"from {start_time} to {end_time}"
+        elif isinstance(time_range, str):
+            display_range = time_range
+
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=plot_buf,
-            caption=f"{sensor_group.capitalize()} data for {device_id} (Range: {time_range})"
+            caption=f"{sensor_group.capitalize()} data for {device_id} (Range: {display_range})"
         )
 
 
@@ -306,7 +443,11 @@ def main():
         states={
             SELECTING_DEVICE: [CallbackQueryHandler(device_selected, pattern=r"^device_")],
             SELECTING_SENSORS: [CallbackQueryHandler(sensors_selected, pattern=r"^sensor_")],
-            SELECTING_RANGE: [CallbackQueryHandler(range_selected, pattern=r"^range_")]
+            SELECTING_RANGE: [CallbackQueryHandler(range_selected, pattern=r"^range_")],
+            ENTERING_START_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_start_date)],
+            ENTERING_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_start_time)],
+            ENTERING_END_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_end_date)],
+            ENTERING_END_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_end_time)]
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
