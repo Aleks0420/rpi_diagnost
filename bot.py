@@ -70,7 +70,7 @@ def query_influx_data(measurement, field, device_id, sensor_name=None, time_rang
     return result
 
 
-def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
+def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None, time_range=None):
     plt.figure(figsize=(12, 6))
     colors = plt.cm.get_cmap("tab10")
     has_plot_elements = False
@@ -78,6 +78,55 @@ def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
     # Установка временной зоны для Москвы (UTC+3)
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
 
+    # Определим границы временного диапазона сразу
+    x_min = None
+    x_max = None
+
+    # Устанавливаем временной диапазон на основе параметра time_range
+    now = datetime.datetime.now(moscow_tz)
+
+    if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
+        try:
+            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
+            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+
+            # Конвертируем в московское время
+            x_min = start_time.astimezone(moscow_tz)
+            x_max = stop_time.astimezone(moscow_tz)
+        except (ValueError, TypeError) as e:
+            print(f"Ошибка при парсинге диапазона времени: {e}")
+    elif isinstance(time_range, str):
+        if time_range == "-1h":
+            x_min = now - datetime.timedelta(hours=1)
+            x_max = now
+        elif time_range == "-24h":
+            x_min = now - datetime.timedelta(hours=24)
+            x_max = now
+        elif time_range == "-7d":
+            x_min = now - datetime.timedelta(days=7)
+            x_max = now
+        elif time_range.startswith("-") and time_range.endswith("h"):
+            try:
+                hours = int(time_range[1:-1])
+                x_min = now - datetime.timedelta(hours=hours)
+                x_max = now
+            except ValueError:
+                pass
+        elif time_range.startswith("-") and time_range.endswith("d"):
+            try:
+                days = int(time_range[1:-1])
+                x_min = now - datetime.timedelta(days=days)
+                x_max = now
+            except ValueError:
+                pass
+
+    # Если не удалось определить границы, используем последний час
+    if x_min is None or x_max is None:
+        x_min = now - datetime.timedelta(hours=1)
+        x_max = now
+        print(f"Не удалось определить границы времени для диапазона {time_range}, используем последний час")
+
+    # Отрисовка данных, если они есть
     for i, (sensor_name, data) in enumerate(data_dict.items()):
         if data.empty:
             continue
@@ -93,17 +142,49 @@ def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
                         linestyle='--',
                         label=f"{sensor_name} Threshold ({thresholds[sensor_name]})")
 
+    # Устанавливаем границы оси X в любом случае
+    plt.xlim(x_min, x_max)
+
+    # Если нет данных, но есть пороговые значения, отрисуем их
+    if not has_plot_elements and thresholds:
+        for i, (sensor_name, threshold) in enumerate(thresholds.items()):
+            plt.axhline(y=threshold,
+                        color=colors(i),
+                        linestyle='--',
+                        label=f"{sensor_name} Threshold ({threshold})")
+            has_plot_elements = True  # Теперь у нас есть хотя бы пороговые линии
+
     plt.title(title)
-    plt.xlabel('Time (Moscow, UTC+3)')  # Указываем временную зону
+    plt.xlabel('Time (Moscow, UTC+3)')
     plt.ylabel(ylabel)
     plt.grid(True)
 
+    # Если все еще нет элементов для отображения, добавим текст
+    if not has_plot_elements:
+        # Добавляем невидимую точку данных в центре диапазона, чтобы масштаб осей был корректным
+        mid_time = x_min + (x_max - x_min) / 2
+        plt.plot([mid_time], [0], alpha=0)  # Невидимая точка
+
+        # Добавляем текст о том, что данных нет
+        plt.text(0.5, 0.5, 'No data available for selected period',
+                 horizontalalignment='center', verticalalignment='center',
+                 transform=plt.gca().transAxes, fontsize=14, color='gray')
+
+    # Добавляем легенду только если есть что показывать
     if has_plot_elements:
         plt.legend()
 
     # Форматирование даты и времени для оси X
     plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d %H:%M:%S', tz=moscow_tz))
     plt.gcf().autofmt_xdate()  # Автоматический поворот дат
+
+    # Устанавливаем Y-ось от 0 до максимального порогового значения, если нет данных
+    if not has_plot_elements and thresholds:
+        max_threshold = max(thresholds.values())
+        plt.ylim(0, max_threshold * 1.2)  # Даем немного места сверху
+    elif not has_plot_elements:
+        # Если нет ни данных, ни порогов, устанавливаем Y-ось от 0 до 1
+        plt.ylim(0, 1)
 
     plt.tight_layout()
     buf = BytesIO()
@@ -276,9 +357,8 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
                 device_id=device_id,
                 time_range=time_range
             )
-            if not data.empty:
-                data_dict[field] = data
-                thresholds[field] = THRESHOLDS["temperature"]["engine_temp"]
+            data_dict[field] = data  # Добавляем даже пустые данные
+            thresholds[field] = THRESHOLDS["temperature"]["engine_temp"]
     elif sensor_group == "current":
         for sensor_name in ["phase_a", "phase_b", "phase_c"]:
             data = query_influx_data(
@@ -294,35 +374,32 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
         data_dict,
         title=f"{sensor_group.capitalize()} Data - {device_id}",
         ylabel="Value",
-        thresholds=thresholds
+        thresholds=thresholds,
+        time_range=time_range  # Передаем time_range в функцию
     )
 
-    if not any(not data.empty for data in data_dict.values()):
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=f"No data available for {sensor_group}."
-        )
-    else:
-        # Форматирование диапазона времени для подписи
-        moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
-        if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
-            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
-            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+    # Форматирование диапазона времени для подписи
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+    if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
+        start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
+        stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
 
-            start_time_moscow = start_time.astimezone(moscow_tz)
-            stop_time_moscow = stop_time.astimezone(moscow_tz)
+        start_time_moscow = start_time.astimezone(moscow_tz)
+        stop_time_moscow = stop_time.astimezone(moscow_tz)
 
-            display_range = (f"from {start_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} "
-                             f"to {stop_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} (Moscow time)")
-        elif isinstance(time_range, str):
-            display_range = f"Last {time_range} (Moscow time)"
+        display_range = (f"from {start_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} "
+                         f"to {stop_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} (Moscow time)")
+    elif isinstance(time_range, str):
+        display_range = f"Last {time_range.replace('-', '')} (Moscow time)"
 
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=plot_buf,
-            caption=(f"{sensor_group.capitalize()} data for {device_id}\n"
-                     f"Time range: {display_range}")
-        )
+    # Всегда отправляем график
+    await context.bot.send_photo(
+        chat_id=update.effective_chat.id,
+        photo=plot_buf,
+        caption=(f"{sensor_group.capitalize()} data for {device_id}\n"
+                 f"Time range: {display_range}" +
+                 (f"\nNo data available in this time range." if not any(not data.empty for data in data_dict.values()) else ""))
+    )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operation cancelled.")
