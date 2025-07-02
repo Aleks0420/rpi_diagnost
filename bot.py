@@ -69,33 +69,49 @@ def query_influx_data(measurement, field, device_id, sensor_name=None, time_rang
         result = pd.concat(result)
     return result
 
+
 def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None):
     plt.figure(figsize=(12, 6))
     colors = plt.cm.get_cmap("tab10")
     has_plot_elements = False
+
+    # Установка временной зоны для Москвы (UTC+3)
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+
     for i, (sensor_name, data) in enumerate(data_dict.items()):
         if data.empty:
             continue
-        plt.plot(data['_time'], data['_value'], label=sensor_name, color=colors(i))
+
+        # Конвертируем время в московское
+        moscow_times = [t.replace(tzinfo=datetime.timezone.utc).astimezone(moscow_tz) for t in data['_time']]
+        plt.plot(moscow_times, data['_value'], label=sensor_name, color=colors(i))
         has_plot_elements = True
+
         if thresholds and sensor_name in thresholds:
             plt.axhline(y=thresholds[sensor_name],
                         color=colors(i),
                         linestyle='--',
                         label=f"{sensor_name} Threshold ({thresholds[sensor_name]})")
+
     plt.title(title)
-    plt.xlabel('Time')
+    plt.xlabel('Time (Moscow, UTC+3)')  # Указываем временную зону
     plt.ylabel(ylabel)
     plt.grid(True)
+
     if has_plot_elements:
         plt.legend()
-    plt.xticks(rotation=45)
+
+    # Форматирование даты и времени для оси X
+    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d %H:%M:%S', tz=moscow_tz))
+    plt.gcf().autofmt_xdate()  # Автоматический поворот дат
+
     plt.tight_layout()
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
     plt.close()
     return buf
+
 
 # --------------------------------------------
 # Telegram Bot Handlers
@@ -235,7 +251,9 @@ async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid time format. Please enter the end time in format HH:MM:")
         return ENTERING_END_TIME
 
-async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group, time_range):
+
+async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group,
+                                 time_range):
     data_dict = {}
     thresholds = {}
     if sensor_group == "vibration":
@@ -271,29 +289,39 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             )
             data_dict[sensor_name] = data
             thresholds[sensor_name] = THRESHOLDS["current"]["phase_a"]
+
     plot_buf = generate_multi_sensor_plot(
         data_dict,
         title=f"{sensor_group.capitalize()} Data - {device_id}",
         ylabel="Value",
         thresholds=thresholds
     )
+
     if not any(not data.empty for data in data_dict.values()):
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"No data available for {sensor_group}."
         )
     else:
-        display_range = time_range
+        # Форматирование диапазона времени для подписи
+        moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
         if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
-            start_time_display = time_range["start"].replace("Z", "")
-            end_time_display = time_range["stop"].replace("Z", "")
-            display_range = f"from {start_time_display} to {end_time_display}"
+            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
+            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+
+            start_time_moscow = start_time.astimezone(moscow_tz)
+            stop_time_moscow = stop_time.astimezone(moscow_tz)
+
+            display_range = (f"from {start_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} "
+                             f"to {stop_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} (Moscow time)")
         elif isinstance(time_range, str):
-            display_range = time_range
+            display_range = f"Last {time_range} (Moscow time)"
+
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=plot_buf,
-            caption=f"{sensor_group.capitalize()} data for {device_id} (Range: {display_range})"
+            caption=(f"{sensor_group.capitalize()} data for {device_id}\n"
+                     f"Time range: {display_range}")
         )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
