@@ -407,6 +407,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
+
+async def new_request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Эта функция запускается по команде /new
+    return await start(update, context)
+
 # --------------------------------------------
 # Обработчик для кнопки "Новый запрос"
 # --------------------------------------------
@@ -414,15 +419,26 @@ async def new_request_selected(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.callback_query.answer()
     user_id = update.effective_user.id
     user_data_cache.pop(user_id, None)
-    # Сообщаем пользователю, что начат новый запрос и запускаем выбор устройства
-    await update.callback_query.edit_message_text("Новый запрос начат. Выберите устройство:")
+
+    # Отправляем новое сообщение с выбором устройства
     devices = ["station_1"]
     keyboard = [[InlineKeyboardButton(dev, callback_data=f"device_{dev}")] for dev in devices]
     keyboard = add_new_request_button(keyboard)
-    await update.callback_query.message.reply_text(
-        "Select device:",
+
+    # Удаляем предыдущее сообщение или скрываем клавиатуру
+    try:
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # Отправляем новое сообщение для начала диалога
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Select device:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+    # Возвращаем начальное состояние
     return SELECTING_DEVICE
 
 # --------------------------------------------
@@ -471,7 +487,10 @@ def main():
                         MessageHandler(filters.TEXT & ~filters.COMMAND, enter_end_time)
                     ]
                 },
-                fallbacks=[CommandHandler("cancel", cancel)]
+                fallbacks=[
+                    CommandHandler("cancel", cancel),
+                    CallbackQueryHandler(new_request_selected, pattern=r"^new_request$")
+                ]
             )
             # Добавляем глобальный обработчик ошибок
             app.add_handler(conv_handler)
