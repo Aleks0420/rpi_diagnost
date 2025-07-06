@@ -392,13 +392,15 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
     elif isinstance(time_range, str):
         display_range = f"Last {time_range.replace('-', '')} (Moscow time)"
 
-    # Всегда отправляем график
+
+    # Модифицируем только отправку фото, добавив reply_markup
     await context.bot.send_photo(
         chat_id=update.effective_chat.id,
         photo=plot_buf,
         caption=(f"{sensor_group.capitalize()} data for {device_id}\n"
-                 f"Time range: {display_range}" +
-                 (f"\nNo data available in this time range." if not any(not data.empty for data in data_dict.values()) else ""))
+                f"Time range: {display_range}" +
+                (f"\nNo data available in this time range." if not any(not data.empty for data in data_dict.values()) else "")),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Новый запрос", callback_data="new_request")]])
     )
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,6 +475,8 @@ def main():
             )
             # Добавляем глобальный обработчик ошибок
             app.add_handler(conv_handler)
+            # Добавить глобальный обработчик для кнопки "Новый запрос"
+            app.add_handler(CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"))
             app.add_error_handler(global_error_handler)
             print("Bot started")
             app.run_polling()
