@@ -10,6 +10,7 @@ import signal
 import copy # For deepcopy if needed, though processing module handles its own copies
 
 from mqtt_buffer_sqlite import init_db
+import gui_config_menu  # import our graphical configuration module
 
 # --- Configuration Management ---
 try:
@@ -146,6 +147,33 @@ def pre_populate_error_states(cfg, latest_vib_data, latest_temp_data, latest_cur
             name = channel_cfg.get('name')
             if name: latest_curr_data[name] = {"error": "not_initialized"}
 
+
+def button_monitor(config, stop_event):
+    """
+    Monitors the button input on GPIO17 (physical pin 11) continuously.
+    When the button is pressed (input goes LOW), it launches the Tkinter-based configuration menu.
+    """
+    import time
+    BUTTON_PIN = 17  # GPIO17 corresponds to physical pin 11
+
+    # Ensure GPIO is set up
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    while not stop_event.is_set():
+        if GPIO.input(BUTTON_PIN) == GPIO.LOW:
+            print("Button pressed! Launching configuration menu...")
+            time.sleep(0.3)  # debounce delay
+            # Wait for release of the button
+            while GPIO.input(BUTTON_PIN) == GPIO.LOW and not stop_event.is_set():
+                time.sleep(0.1)
+            # Replace incorrect call with instantiation of the ConfigMenuGUI class
+            from gui_config_menu import ConfigMenuGUI
+            ConfigMenuGUI(config)
+            print("Configuration menu closed. Resuming normal operation.")
+        time.sleep(0.2)
+
+
 def main():
     """Main function to load config, run menu, initialize sensors, and start threads."""
     global config, latest_vibration_data, latest_temperature_data, latest_current_data
@@ -181,7 +209,7 @@ def main():
     mqtt_port = config.get('mqtt', {}).get('port', 1883)
 
     if LEDS_AVAILABLE:
-        led_indicator = LEDIndicator(green_pin=17, blue_pin=18, yellow_pin=27, red_pin=22, white_pin=23)
+        led_indicator = LEDIndicator(green_pin=5, blue_pin=6, yellow_pin=13, red_pin=19, white_pin=26)
     else:
         led_indicator = None
 
@@ -292,6 +320,12 @@ def main():
     threads.append(watchdog_thread)
     watchdog_thread.start()
     print("MQTT Watchdog thread started.")
+
+    # Start Button Monitor Thread ---
+    button_thread = threading.Thread(target=button_monitor, args=(config, stop_event), daemon=True)
+    button_thread.start()
+    print("Button monitor thread started.")
+
     signal.signal(signal.SIGINT, signal_handler)  # Handle Ctrl+C
     signal.signal(signal.SIGTERM, signal_handler) # Handle kill signal
 
@@ -308,7 +342,7 @@ def main():
             #    print("A critical non-daemon thread seems to have exited. Stopping.")
             #    stop_event.set()
             # For daemon threads, this check is less critical as they won't keep python alive
-            stop_event.wait() # Wait indefinitely until stop_event is set
+            stop_event.wait(1) # Wait indefinitely until stop_event is set
 
     except KeyboardInterrupt: # Redundant if SIGINT is handled, but good fallback
         print("KeyboardInterrupt caught in main loop. Stopping...")
