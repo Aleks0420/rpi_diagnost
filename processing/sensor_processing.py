@@ -21,6 +21,8 @@ except ImportError:
     CURRENT_SENSORS_MEASUREMENT_AVAILABLE = False
     print("Warning: 'measure_all_currents' not found in sensor_processing.py. Current reading will fail if attempted.")
 
+EARTBEAT_TIMEOUT = 30
+
 
 def mpu_processing_and_publish_loop(
         mpu_sensors,  # dict of {name: MPU6050_object}
@@ -31,7 +33,7 @@ def mpu_processing_and_publish_loop(
         latest_temperature_data_ref,
         latest_current_data_ref,
         is_mqtt_connected_func,
-        led_indicator = None
+        led_indicator=None
 ):
     print("MPU processing and publishing thread started.")
 
@@ -46,24 +48,16 @@ def mpu_processing_and_publish_loop(
     fft_config = config.get('sensors', {}).get('mpu6050_fft', {})
     n_fft_peaks_to_report = fft_config.get('n_peaks', 5)  # Default if not in config
 
-    # Interval for calling sensor.update_buffer().
-    # This should ideally be faster than the sample period of the fastest MPU.
-    # Example: If fastest MPU is 200Hz (5ms period), call update_buffer every ~2-4ms.
-    # The MPU6050 hardware itself samples at its configured rate.
-    # We use a fixed small interval here.
-    update_call_interval_sec = 0.004  # e.g., 4ms (250 Hz call rate for update_buffer)
+    # Interval for calling sensor.update_buffer()
+    update_call_interval_sec = 0.004  # ~4ms (250Hz call rate for update_buffer)
 
-    last_publish_time = time.time()  # Publish immediately on first iteration if interval allows
+    # Heartbeat monitoring
+    HEARTBEAT_TIMEOUT = 30  # seconds without data = connection lost
+    last_data_time = time.time()
+    last_publish_time = time.time()
 
     if not mpu_sensors:
         print("No MPU sensors configured or initialized. MPU processing loop will not run effectively.")
-        # Errors should be in latest_vibration_data_ref["general"] from main/initializer
-        # Loop will still run to allow publishing other sensor data if any, but vibration will be from errors.
-    else:
-        # Populate initial state for successfully initialized sensors
-        for name, sensor in mpu_sensors.items():
-            if name not in latest_vibration_data_ref or not isinstance(latest_vibration_data_ref[name], dict):
-                latest_vibration_data_ref[name] = {"status": "initializing"}
 
     while not stop_event.is_set():
         loop_start_time = time.time()
@@ -74,10 +68,8 @@ def mpu_processing_and_publish_loop(
                 try:
                     sensor.update_buffer()  # Updates internal buffer of the MPU object
                 except Exception as e:
-                    # This error might occur if I2C communication fails during runtime
                     error_msg = f"Buffer update error for MPU '{name}': {e}"
                     print(error_msg)
-                    # Avoid overwriting more specific init errors if they exist
                     if name in latest_vibration_data_ref and isinstance(latest_vibration_data_ref[name], dict):
                         if latest_vibration_data_ref[name].get("error") != "buffer_update_failed":
                             latest_vibration_data_ref[name] = {"error": "buffer_update_failed", "details": str(e)}
@@ -85,86 +77,74 @@ def mpu_processing_and_publish_loop(
                         latest_vibration_data_ref[name] = {"error": "buffer_update_failed", "details": str(e)}
 
         # --- Check if it's time to compute metrics and publish ---
-        if (loop_start_time - last_publish_time) >= publish_interval_sec:
-
+        current_time = time.time()
+        if (current_time - last_publish_time) >= publish_interval_sec:
             # --- VIBRATION Metrics ---
-            # Update latest_vibration_data_ref for successfully initialized MPU sensors
-            # For sensors that failed init, their error state from initializer remains.
-            if mpu_sensors:
-                for name, sensor in mpu_sensors.items():
-                    try:
-                        metrics = sensor.get_vibration_metrics(n_fft_peaks=n_fft_peaks_to_report)
-                        latest_vibration_data_ref[name] = metrics
-                    except Exception as e:
-                        error_msg = f"Metrics computation error for MPU '{name}': {e}"
-                        print(error_msg)
-                        # traceback.print_exc() # Uncomment for detailed debugging
-                        # Avoid overwriting more specific init errors
-                        current_state_is_error = (isinstance(latest_vibration_data_ref.get(name), dict) and
-                                                  "error" in latest_vibration_data_ref[name])
-                        if not current_state_is_error or \
-                                latest_vibration_data_ref[name].get("error") != "metrics_failed":
-                            latest_vibration_data_ref[name] = {"error": "metrics_failed", "details": str(e)}
-
-            # Construct the 'vibration' part of the MQTT payload using latest_vibration_data_ref
-            # This dictionary should already contain:
-            # - Metrics for successfully read MPUs.
-            # - "metrics_failed" or "buffer_update_failed" errors for runtime issues.
-            # - Initialization errors (e.g., "initialization_failed", "config_incomplete") from sensor_initializer.
-            # - General errors (e.g., "not_found_module") from main's pre_populate_error_states.
-
-            # We only want to publish data for sensors explicitly listed in mpu6050 config
             vibration_mqtt_payload = {}
-            for mpu_cfg_item in config.get('sensors', {}).get('mpu6050', []):
-                mpu_name_from_config = mpu_cfg_item.get('name')
-                if mpu_name_from_config:
-                    # Get the current state/metrics for this configured sensor
-                    vibration_mqtt_payload[mpu_name_from_config] = latest_vibration_data_ref.get(
-                        mpu_name_from_config, {"error": "state_unavailable_in_processing_loop"}
-                    )
+            if mpu_sensors:
+                for mpu_cfg_item in config.get('sensors', {}).get('mpu6050', []):
+                    mpu_name_from_config = mpu_cfg_item.get('name')
+                    if mpu_name_from_config in mpu_sensors:
+                        try:
+                            metrics = mpu_sensors[mpu_name_from_config].get_vibration_metrics(
+                                n_fft_peaks=n_fft_peaks_to_report)
+                            vibration_mqtt_payload[mpu_name_from_config] = metrics
+                        except Exception as e:
+                            error_msg = f"Metrics computation error for MPU '{mpu_name_from_config}': {e}"
+                            print(error_msg)
+                            vibration_mqtt_payload[mpu_name_from_config] = {
+                                "error": "metrics_failed",
+                                "details": str(e)
+                            }
 
-            # Include general vibration error if it exists (e.g., module not found)
+            # Include general vibration error if it exists
             if "general" in latest_vibration_data_ref:
                 vibration_mqtt_payload["general"] = latest_vibration_data_ref["general"]
 
             # --- Prepare final MQTT payload ---
             payload = {
                 "device_id": device_id,
-                "timestamp": time.time(),  # Use current time for assembled payload
+                "timestamp": current_time,
                 "vibration": copy.deepcopy(vibration_mqtt_payload),
                 "temperature": copy.deepcopy(latest_temperature_data_ref),
                 "current": copy.deepcopy(latest_current_data_ref)
             }
 
-            # --- Publish ---
-            if is_mqtt_connected_func():
-                try:
+            # --- Publish Data ---
+            try:
+                if is_mqtt_connected_func():
+                    # First flush any buffered messages
                     flush_if_connected(mqtt_client, mqtt_topic, mqtt_qos, is_mqtt_connected_func)
-                    json_payload = json.dumps(payload)
-                    mqtt_client.publish(mqtt_topic, json_payload, qos=mqtt_qos)
+
+                    # Publish current data
+                    mqtt_client.publish(mqtt_topic, json.dumps(payload), qos=mqtt_qos)
+
+                    # Update last data time and indicate success
+                    last_data_time = current_time
                     if led_indicator:
-                        led_indicator.set_yellow(True)
-                        time.sleep(0.05) # Short blink
-                        led_indicator.set_yellow(False)
-                except Exception as e_pub:
-                    print(f"Error sending MQTT, save to buffer: {e_pub}")
+                        led_indicator.data_sent_success()  # Short yellow flash
+                else:
+                    # Save to buffer and indicate failure
                     buffer_message(payload)
                     if led_indicator:
-                         led_indicator.set_red(True) # Indicate buffer error, could also blink
-                         time.sleep(0.1)
-                         led_indicator.set_red(False)
-
-            else:
-                print("MQTT disabled, save to buffer.")
+                        led_indicator.data_sent_failed()  # Short red flash
+            except Exception as e_pub:
+                print(f"Error sending MQTT, save to buffer: {e_pub}")
                 buffer_message(payload)
                 if led_indicator:
-                    led_indicator.set_red(True) # Indicate buffer error, could also blink
-                    time.sleep(0.1)
-                    led_indicator.set_red(False)
+                    led_indicator.data_sent_failed()
 
             last_publish_time = loop_start_time
 
-        # --- Sleep to control update_buffer() call rate ---
+        # --- Heartbeat Monitoring ---
+        if current_time - last_data_time > HEARTBEAT_TIMEOUT:
+            if led_indicator:
+                led_indicator.start_heartbeat_timeout()  # Solid yellow for timeout
+        else:
+            if led_indicator:
+                led_indicator.stop_heartbeat_timeout()
+
+        # --- Sleep to control update rate ---
         elapsed_since_loop_start = time.time() - loop_start_time
         sleep_duration = update_call_interval_sec - elapsed_since_loop_start
         if sleep_duration > 0:
