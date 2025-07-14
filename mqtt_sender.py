@@ -93,6 +93,8 @@ def parse_arguments():
 def signal_handler(signum, frame):
     """Handles signals (like Ctrl+C) to stop the application."""
     print(f"\nSignal {signum} received. Stopping threads...")
+    if led_indicator:
+        led_indicator.cleanup()
     stop_event.set()
     if LEDS_AVAILABLE:
        GPIO.cleanup() # To ensure all GPIOs are reset to default state before exiting.
@@ -210,6 +212,9 @@ def main():
 
     if LEDS_AVAILABLE:
         led_indicator = LEDIndicator(green_pin=5, blue_pin=6, yellow_pin=13, red_pin=19, white_pin=26)
+        # Индикация калибровки
+        if args.calibrate is not None:
+            led_indicator.start_calibration()
     else:
         led_indicator = None
 
@@ -227,23 +232,26 @@ def main():
     # or remove entries on success.
     print("\nInitializing sensors...")
     mpu_configs = config.get('sensors', {}).get('mpu6050', [])
-    initialized_mpu_sensors = initialize_mpu_sensors(
-        mpu_configs, latest_vibration_data, calibrate_flag=mpu_calibrate_flag
-    )
+    try:
+        initialized_mpu_sensors = initialize_mpu_sensors(
+            mpu_configs, latest_vibration_data, calibrate_flag=mpu_calibrate_flag
+        )
 
-    ds_configs = config.get('sensors', {}).get('ds18b20', [])
-    initialized_ds18b20_sensors = initialize_ds18b20_sensors(
-        ds_configs, latest_temperature_data
-    )
+        ds_configs = config.get('sensors', {}).get('ds18b20', [])
+        initialized_ds18b20_sensors = initialize_ds18b20_sensors(
+            ds_configs, latest_temperature_data
+        )
 
-    current_cfg = config.get('sensors', {}).get('current', {})
-    initialized_current_data = initialize_current_sensors(
-        current_cfg, latest_current_data, calibrate_flag=current_calibrate_flag
-    ) # Returns a dict or None
+        current_cfg = config.get('sensors', {}).get('current', {})
+        initialized_current_data = initialize_current_sensors(
+            current_cfg, latest_current_data, calibrate_flag=current_calibrate_flag
+        ) # Returns a dict or None
 
-    if led_indicator:
-       led_indicator.set_white(args.calibrate is True) # True if forced, None defaults to config, but set_white only takes bool
-
+        if led_indicator:
+           led_indicator.set_white(args.calibrate is True) # True if forced, None defaults to config, but set_white only takes bool
+    finally:
+        if led_indicator:
+            led_indicator.stop_calibration()
 
     # --- 6. Start Sensor Reading and Processing Threads ---
     print("\nStarting sensor processing threads...")
