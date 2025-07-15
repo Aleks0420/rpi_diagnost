@@ -16,11 +16,20 @@ class DS18B20:
             return f.readlines()
 
     def get_temperature(self):
-        lines = self.read_temp_raw()
-        while lines[0].strip()[-3:] != 'YES':
+        max_attempts = 3
+        attempt = 0
+        while attempt < max_attempts:
             lines = self.read_temp_raw()
-        equals_pos = lines[1].find('t=')
-        if equals_pos != -1:
-            temp_string = lines[1][equals_pos + 2:]
-            temp_c = float(temp_string) / 1000.0
-            return temp_c
+            if len(lines) >= 2 and lines[0].strip()[-3:] == 'YES':
+                equals_pos = lines[1].find('t=')
+                if equals_pos != -1:
+                    temp_string = lines[1][equals_pos + 2:]
+                    try:
+                        temp_c = float(temp_string) / 1000.0
+                        return temp_c
+                    except ValueError:
+                        pass  # Если преобразование не удалось, пробуем заново.
+            attempt += 1
+            time.sleep(0.3)  # Задержка перед повторной попыткой
+        # Если не удалось получить корректное значение за несколько попыток – можно вернуть ошибку или None.
+        raise RuntimeError("Не удалось получить корректное значение температуры")
