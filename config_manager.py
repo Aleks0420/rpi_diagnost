@@ -191,17 +191,30 @@ def run_config_menu(config_data):
             configure_calibration_settings(config_data['calibration'])
 
         # ... (Handling for S, L, R, X, START remains the same) ...
-        elif choice == 'S': save_config(config_data)
+        elif choice == 'S':
+            success = save_config(config_data)
+            if success:
+                print("\n>>> Configuration has been successfully saved to file. <<<\n")
+            else:
+                print("\n>>> Failed to save configuration to file! <<<\n")
         elif choice == 'L':
             loaded = load_config(CONFIG_FILE)
             config_data.clear()
             config_data.update(loaded)
+            print("\n>>> Configuration has been successfully loaded from file. <<<\n")
         elif choice == 'R':
             default = get_default_config()
             config_data.clear()
             config_data.update(default)
-        elif choice == 'X': return False
-        elif choice == 'START': return True
+            print("\n>>> Configuration has been restored to default values. <<<\n")
+        elif choice == 'X':
+            print("\n>>> Exiting configuration menu without saving. <<<\n")
+            return False
+        elif choice == 'START':
+            print("\n>>> Starting data collection with current configuration... <<<\n")
+            save_config(config_data)  # Автоматически сохраняем конфигурацию перед запуском
+            print("Configuration saved before starting data collection.")
+            return True
         else: print("Invalid choice.")
 
 
