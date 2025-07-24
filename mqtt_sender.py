@@ -10,7 +10,7 @@ import signal
 import copy # For deepcopy if needed, though processing module handles its own copies
 
 from mqtt_buffer_sqlite import init_db
-import gui_config_menu  # import our graphical configuration module
+# import gui_config_menu  # import our graphical configuration module
 
 # --- Configuration Management ---
 try:
@@ -205,7 +205,7 @@ def run_config_menu_thread(current_config, stop_event):
         # Update the main configuration with the changes
         config.clear()
         config.update(temp_config)
-        save_config(config)  # Save to file
+        # Не сохраняем еще раз, т.к. уже сохранили в run_config_menu
         # Reinitialize sensors and threads
         initialize_sensors_and_threads()
     else:
@@ -219,11 +219,11 @@ def initialize_sensors_and_threads():
     global mqtt_client, led_indicator
 
     # --- 4. Pre-populate shared data with initial error states ---
-    print("\nPre-populating sensor states...")
+    print("\n--- Pre-populating sensor states... ---\n")
     pre_populate_error_states(config, latest_vibration_data, latest_temperature_data, latest_current_data)
 
     # --- 5. Initialize Sensors based on final configuration ---
-    print("\nInitializing sensors...")
+    print("\n--- Initializing sensors... ---\n")
     mpu_configs = config.get('sensors', {}).get('mpu6050', [])
     initialized_mpu_sensors = initialize_mpu_sensors(
         mpu_configs, latest_vibration_data, calibrate_flag=config.get('calibration', {}).get('mpu', True)
@@ -239,8 +239,18 @@ def initialize_sensors_and_threads():
         current_cfg, latest_current_data, calibrate_flag=config.get('calibration', {}).get('current', True)
     )  # Returns a dict or None
 
+    # --- Reconnect MQTT client if needed ---
+    if mqtt_client:
+        # Если клиент был отключен, переподключаем его
+        if not is_mqtt_connected():
+            device_id = config.get('device_id', 'unknown_device')
+            mqtt_broker = config.get('mqtt', {}).get('broker', '127.0.0.1')
+            mqtt_port = config.get('mqtt', {}).get('port', 1883)
+            connect_mqtt(mqtt_client, mqtt_broker, mqtt_port, device_id, stop_event, led_indicator)
+            print("MQTT client reconnected.")
+
     # --- 6. Start Sensor Reading and Processing Threads ---
-    print("\nStarting sensor processing threads...")
+    print("\n--- Starting sensor processing threads... ---\n")
     threads.clear()
 
     # MPU Processing and Publishing Thread
@@ -296,6 +306,18 @@ def initialize_sensors_and_threads():
         # Info already provided by pre_populate_error_states and initialize_current_sensors
         pass  # print("Current sensors not initialized/configured, current thread not started.")
 
+    # MQTT Watchdog Thread
+    watchdog_thread = threading.Thread(
+        target=mqtt_watchdog_loop,
+        args=(mqtt_client, config, stop_event, is_mqtt_connected),
+        daemon=True
+    )
+    threads.append(watchdog_thread)
+    watchdog_thread.start()
+    print("MQTT Watchdog thread started.")
+
+    print("\n>>> Configuration applied successfully. Data collection is running... <<<\n")
+
 
 def stop_threads():
     """Stops all sensor processing threads."""
@@ -307,6 +329,7 @@ def stop_threads():
     threads.clear()
     stop_event.clear()
     print("All sensor processing threads stopped.")
+
 
 def main():
     """Main function to load config, run menu, initialize sensors, and start threads."""
