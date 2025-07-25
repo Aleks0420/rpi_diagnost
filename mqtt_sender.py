@@ -22,7 +22,7 @@ except ImportError:
 
 # --- MQTT Utilities ---
 try:
-    from mqtt_utils import create_mqtt_client, connect_mqtt, is_mqtt_connected
+    from mqtt_utils import create_mqtt_client, connect_mqtt, is_mqtt_connected, monitor_mqtt_connection
     print("MQTT utilities module loaded.")
 except ImportError:
     print("Error: mqtt_utils.py not found. Cannot run application.")
@@ -364,6 +364,10 @@ def main():
 
     mqtt_client = create_mqtt_client(client_id=device_id)
     connect_mqtt(mqtt_client, mqtt_broker, mqtt_port, device_id, stop_event, led_indicator)
+
+    monitor_thread = threading.Thread(target=monitor_mqtt_connection, args=(mqtt_client, stop_event, led_indicator))
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
     # --- 3. Set up signal handling for clean exit ---
     signal.signal(signal.SIGINT, signal_handler)  # Handle Ctrl+C
