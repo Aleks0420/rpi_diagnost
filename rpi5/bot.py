@@ -1,6 +1,7 @@
 import os
 import time
 import datetime
+import pytz
 import asyncio
 from io import BytesIO
 import matplotlib.pyplot as plt
@@ -26,6 +27,9 @@ INFLUXDB_BUCKET = "eng_bucket"
 # --- Telegram Bot Configuration ---
 TELEGRAM_TOKEN = "7882919864:AAH9wV2YYW625b9RsQPrzl87wpv8cgPFWVA"
 ALLOWED_USER_IDS = [703548391]
+
+# --- Timezone Configuration ---
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 # --- Thresholds for Alerts ---
 THRESHOLDS = {
@@ -71,69 +75,86 @@ def query_influx_data(measurement, field, device_id, sensor_name=None, time_rang
 
 
 def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None, time_range=None):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import datetime
+
     plt.figure(figsize=(12, 6))
     colors = plt.cm.get_cmap("tab10")
     has_plot_elements = False
 
-    # Установка временной зоны для Москвы (UTC+3)
+    # Определяем московский часовой пояс
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
 
-    # Определим границы временного диапазона сразу
-    x_min = None
-    x_max = None
-
-    # Устанавливаем временной диапазон на основе параметра time_range
+    # Определяем границы временного диапазона
     now = datetime.datetime.now(moscow_tz)
-
     if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
         try:
-            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
-            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
-
-            # Конвертируем в московское время
-            x_min = start_time.astimezone(moscow_tz)
-            x_max = stop_time.astimezone(moscow_tz)
-        except (ValueError, TypeError) as e:
-            print(f"Ошибка при парсинге диапазона времени: {e}")
+            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00")).astimezone(
+                moscow_tz)
+            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00")).astimezone(moscow_tz)
+        except Exception as e:
+            print(f"Ошибка парсинга диапазона времени: {e}")
+            start_time = now - datetime.timedelta(hours=1)
+            stop_time = now
     elif isinstance(time_range, str):
         if time_range == "-1h":
-            x_min = now - datetime.timedelta(hours=1)
-            x_max = now
+            start_time = now - datetime.timedelta(hours=1)
+            stop_time = now
         elif time_range == "-24h":
-            x_min = now - datetime.timedelta(hours=24)
-            x_max = now
+            start_time = now - datetime.timedelta(hours=24)
+            stop_time = now
         elif time_range == "-7d":
-            x_min = now - datetime.timedelta(days=7)
-            x_max = now
-        elif time_range.startswith("-") and time_range.endswith("h"):
-            try:
-                hours = int(time_range[1:-1])
-                x_min = now - datetime.timedelta(hours=hours)
-                x_max = now
-            except ValueError:
-                pass
-        elif time_range.startswith("-") and time_range.endswith("d"):
-            try:
-                days = int(time_range[1:-1])
-                x_min = now - datetime.timedelta(days=days)
-                x_max = now
-            except ValueError:
-                pass
+            start_time = now - datetime.timedelta(days=7)
+            stop_time = now
+        else:
+            start_time = now - datetime.timedelta(hours=1)
+            stop_time = now
+    else:
+        start_time = now - datetime.timedelta(hours=1)
+        stop_time = now
 
-    # Если не удалось определить границы, используем последний час
-    if x_min is None or x_max is None:
-        x_min = now - datetime.timedelta(hours=1)
-        x_max = now
-        print(f"Не удалось определить границы времени для диапазона {time_range}, используем последний час")
-
-    # Отрисовка данных, если они есть
+    # Отрисовка данных для каждого датчика
     for i, (sensor_name, data) in enumerate(data_dict.items()):
         if data.empty:
             continue
+        # Преобразуем столбец времени в datetime и затем в московское время
+        try:
+            times = [pd.to_datetime(t).replace(tzinfo=datetime.timezone.utc).astimezone(moscow_tz) for t in
+                     data['_time']]
+        except Exception as e:
+            print(f"Ошибка преобразования времени для {sensor_name}: {e}")
+            continue
+        values = data['_value'].values
 
-        # Конвертируем время в московское
-        moscow_times = [t.replace(tzinfo=datetime.timezone.utc).astimezone(moscow_tz) for t in data['_time']]
-        plt.plot(moscow_times, data['_value'], label=sensor_name, color=colors(i))
+        # Создадим списки с возможными разрывами: если разница между соседними точками больше порога, вставляем NaN
+        new_times = []
+        new_values = []
+        # Рассчитываем средний интервал (если больше одной точки)
+        if len(times) > 1:
+            deltas = [(times[j + 1] - times[j]).total_seconds() for j in range(len(times) - 1)]
+            avg_interval = np.mean(deltas)
+        else:
+            avg_interval = 0
+
+        # Порог: если интервал > 1.5 * среднего (или, если avg_interval == 0, можно задать фиксированный порог, например, 60 сек)
+        gap_threshold = 1.5 * avg_interval if avg_interval > 0 else 60
+
+        for j in range(len(times) - 1):
+            new_times.append(times[j])
+            new_values.append(values[j])
+            delta = (times[j + 1] - times[j]).total_seconds()
+            if delta > gap_threshold:
+                # Вставляем NaN в качестве разрыва
+                # Для временной метки можно взять среднее время между точками
+                gap_time = times[j] + (times[j + 1] - times[j]) / 2
+                new_times.append(gap_time)
+                new_values.append(np.nan)
+        # Добавим последнюю точку
+        new_times.append(times[-1])
+        new_values.append(values[-1])
+
+        plt.plot(new_times, new_values, label=sensor_name, color=colors(i))
         has_plot_elements = True
 
         if thresholds and sensor_name in thresholds:
@@ -142,51 +163,29 @@ def generate_multi_sensor_plot(data_dict, title, ylabel, thresholds=None, time_r
                         linestyle='--',
                         label=f"{sensor_name} Threshold ({thresholds[sensor_name]})")
 
-    # Устанавливаем границы оси X в любом случае
-    plt.xlim(x_min, x_max)
+    # Устанавливаем границы оси X, чтобы даже если данных не хватает они выставлялись
+    plt.xlim(start_time, stop_time)
 
-    # Если нет данных, но есть пороговые значения, отрисуем их
-    if not has_plot_elements and thresholds:
-        for i, (sensor_name, threshold) in enumerate(thresholds.items()):
-            plt.axhline(y=threshold,
-                        color=colors(i),
-                        linestyle='--',
-                        label=f"{sensor_name} Threshold ({threshold})")
-            has_plot_elements = True  # Теперь у нас есть хотя бы пороговые линии
+    if not has_plot_elements:
+        mid_time = start_time + (stop_time - start_time) / 2
+        plt.plot([mid_time], [0], alpha=0)
+        plt.text(0.5, 0.5, 'No data available for selected period',
+                 horizontalalignment='center', verticalalignment='center',
+                 transform=plt.gca().transAxes, fontsize=14, color='gray')
+
+    if has_plot_elements:
+        plt.legend()
 
     plt.title(title)
     plt.xlabel('Time (Moscow, UTC+3)')
     plt.ylabel(ylabel)
     plt.grid(True)
-
-    # Если все еще нет элементов для отображения, добавим текст
-    if not has_plot_elements:
-        # Добавляем невидимую точку данных в центре диапазона, чтобы масштаб осей был корректным
-        mid_time = x_min + (x_max - x_min) / 2
-        plt.plot([mid_time], [0], alpha=0)  # Невидимая точка
-
-        # Добавляем текст о том, что данных нет
-        plt.text(0.5, 0.5, 'No data available for selected period',
-                 horizontalalignment='center', verticalalignment='center',
-                 transform=plt.gca().transAxes, fontsize=14, color='gray')
-
-    # Добавляем легенду только если есть что показывать
-    if has_plot_elements:
-        plt.legend()
-
-    # Форматирование даты и времени для оси X
     plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d %H:%M:%S', tz=moscow_tz))
-    plt.gcf().autofmt_xdate()  # Автоматический поворот дат
-
-    # Устанавливаем Y-ось от 0 до максимального порогового значения, если нет данных
-    if not has_plot_elements and thresholds:
-        max_threshold = max(thresholds.values())
-        plt.ylim(0, max_threshold * 1.2)  # Даем немного места сверху
-    elif not has_plot_elements:
-        # Если нет ни данных, ни порогов, устанавливаем Y-ось от 0 до 1
-        plt.ylim(0, 1)
-
+    plt.gcf().autofmt_xdate()
     plt.tight_layout()
+
+    # Сохраняем график в буфер
+    from io import BytesIO
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100)
     buf.seek(0)
@@ -274,52 +273,74 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def enter_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    start_date = update.message.text
+    start_date_str = update.message.text
     try:
-        datetime.datetime.strptime(start_date, "%Y-%m-%d")
+        start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").date()
         user_data_cache[user_id]["start_date"] = start_date
-        await update.message.reply_text("Please enter the start time in format HH:MM:")
+        await update.message.reply_text("Please enter the start time in format HH:MM (Moscow time):")
         return ENTERING_START_TIME
     except ValueError:
-        await update.message.reply_text("Invalid date format. Please enter the start date in format YYYY-MM-DD:")
+        await update.message.reply_text("Invalid date format. Please enter the start date in format YYYY-MM-DD (Moscow time):")
         return ENTERING_START_DATE
+
 
 async def enter_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    start_time = update.message.text
+    start_time_str = update.message.text
     try:
-        datetime.datetime.strptime(start_time, "%H:%M")
-        user_data_cache[user_id]["start_time"] = start_time
-        await update.message.reply_text("Please enter the end date in format YYYY-MM-DD:")
+        start_time = datetime.datetime.strptime(start_time_str, "%H:%M").time()
+
+        # Combine date and time, localize to Moscow timezone, then convert to UTC
+        start_date = user_data_cache[user_id]["start_date"]
+        start_datetime_moscow = MOSCOW_TZ.localize(datetime.datetime.combine(start_date, start_time))
+        start_datetime_utc = start_datetime_moscow.astimezone(pytz.utc)
+
+        user_data_cache[user_id]["start_datetime_utc"] = start_datetime_utc # Save datetime object
+        await update.message.reply_text("Please enter the end date in format YYYY-MM-DD (Moscow time):")
         return ENTERING_END_DATE
+
     except ValueError:
-        await update.message.reply_text("Invalid time format. Please enter the start time in format HH:MM:")
+        await update.message.reply_text("Invalid time format. Please enter the start time in format HH:MM (Moscow time):")
         return ENTERING_START_TIME
+
 
 async def enter_end_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    end_date = update.message.text
+    end_date_str = update.message.text
     try:
-        datetime.datetime.strptime(end_date, "%Y-%m-%d")
-        user_data_cache[user_id]["end_date"] = end_date
-        await update.message.reply_text("Please enter the end time in format HH:MM:")
+        end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        user_data_cache[user_id]["end_date"] =  end_date
+        await update.message.reply_text("Please enter the end time in format HH:MM (Moscow time):")
         return ENTERING_END_TIME
     except ValueError:
-        await update.message.reply_text("Invalid date format. Please enter the end date in format YYYY-MM-DD:")
+        await update.message.reply_text("Invalid date format. Please enter the end date in format YYYY-MM-DD (Moscow time):")
         return ENTERING_END_DATE
+
 
 async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    end_time = update.message.text
+    end_time_str = update.message.text
     try:
-        datetime.datetime.strptime(end_time, "%H:%M")
-        user_data_cache[user_id]["end_time"] = end_time
-        start_datetime = f"{user_data_cache[user_id]['start_date']}T{user_data_cache[user_id]['start_time']}:00Z"
-        end_datetime = f"{user_data_cache[user_id]['end_date']}T{user_data_cache[user_id]['end_time']}:00Z"
-        time_range = {"start": start_datetime, "stop": end_datetime}
-        user_data_cache[user_id]["time_range"] = time_range
+        end_time = datetime.datetime.strptime(end_time_str, "%H:%M").time()
+
+        # Combine date and time, localize to Moscow timezone, then convert to UTC
+        end_date = user_data_cache[user_id]["end_date"]
+        end_datetime_moscow = MOSCOW_TZ.localize(datetime.datetime.combine(end_date, end_time))
+        end_datetime_utc = end_datetime_moscow.astimezone(pytz.utc)
+
+        user_data_cache[user_id]["end_datetime_utc"] = end_datetime_utc # Save datetime object
+
+        # Generate the time range for InfluxDB
+        time_range = {
+            "start": user_data_cache[user_id]["start_datetime_utc"].isoformat().replace("+00:00", "Z"),
+            "stop": user_data_cache[user_id]["end_datetime_utc"].isoformat().replace("+00:00", "Z")
+        }
+        user_data_cache[user_id]["time_range"] = time_range # Save to cache in correct format
+
+
         device_id = user_data_cache[user_id]["device_id"]
         sensor_group = user_data_cache[user_id]["sensor_group"]
+
         await update.message.reply_text("Generating plot(s)...")
         if sensor_group == "all":
             await generate_and_send_plot(update, context, device_id, "vibration", time_range)
@@ -328,8 +349,10 @@ async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await generate_and_send_plot(update, context, device_id, sensor_group, time_range)
         return ConversationHandler.END
+
+
     except ValueError:
-        await update.message.reply_text("Invalid time format. Please enter the end time in format HH:MM:")
+        await update.message.reply_text("Invalid time format. Please enter the end time in format HH:MM (Moscow time):")
         return ENTERING_END_TIME
 
 
@@ -381,17 +404,20 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
     # Форматирование диапазона времени для подписи
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
     if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
-        start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
-        stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+        try:
+            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
+            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+            start_time_moscow = start_time.astimezone(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
+            stop_time_moscow = stop_time.astimezone(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
 
-        start_time_moscow = start_time.astimezone(moscow_tz)
-        stop_time_moscow = stop_time.astimezone(moscow_tz)
+            display_range = f"from {start_time_moscow} to {stop_time_moscow} (Moscow time)"
 
-        display_range = (f"from {start_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} "
-                         f"to {stop_time_moscow.strftime('%Y-%m-%d %H:%M:%S')} (Moscow time)")
+        except ValueError:
+            display_range = "Invalid custom time range"
     elif isinstance(time_range, str):
         display_range = f"Last {time_range.replace('-', '')} (Moscow time)"
-
+    else:
+        display_range = "Unknown time range"
 
     # Модифицируем только отправку фото, добавив reply_markup
     await context.bot.send_photo(
