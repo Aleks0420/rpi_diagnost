@@ -249,10 +249,26 @@ def add_global_buttons(keyboard):
 # --------------------------------------------
 # Telegram Bot Handlers
 
+async def reset_state(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает состояние пользователя и очищает кэш."""
+    user_id = update.effective_user.id
+    user_data_cache.pop(user_id, None)  # Очистка пользовательских данных
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Состояние сброшено. Вы можете начать новую команду."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start. Всегда начинает новый сеанс."""
+    # Сбрасываем состояние пользователя
+    await reset_state(update, context)
+
+    # Проверяем, разрешён ли доступ пользователю
     if update.effective_user.id not in ALLOWED_USER_IDS:
         await update.message.reply_text("Access denied.")
         return ConversationHandler.END
+
     devices = ["station_1", "station_2", "station_3"]
     keyboard = [[InlineKeyboardButton(dev, callback_data=f"device_{dev}")] for dev in devices]
     keyboard = add_global_buttons(keyboard)
@@ -469,15 +485,9 @@ async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTERING_END_TIME
 
 
-async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group,
-                                 time_range):
-    data_dict = {}
-    thresholds = {}
-    # Выводим отладочную информацию:
-    print(f"[DEBUG] device_id для графика: '{device_id}'")
-    print(f"[DEBUG] Содержимое device_thresholds: {device_thresholds}")
-
-    # Если для данного устройства настроек нет, используем дефолтные
+async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group, time_range):
+    """Генерирует и отправляет графики по выбранной группе сенсоров."""
+    # Проверяем настройки для выбранного устройства
     if device_id in device_thresholds:
         current_thresholds = device_thresholds[device_id]
     else:
@@ -486,9 +496,11 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             "temperature": DEFAULT_THRESHOLDS["temperature"]["engine_temp"],
             "current": DEFAULT_THRESHOLDS["current"]["phase_a"]
         }
-    # Далее собираем данные и подготавливаем пороги по каждой группе датчиков
+
+    # Графики по вибрации для каждого сенсора отдельно
     if sensor_group == "vibration":
         for sensor_name in ["engine", "gearbox"]:
+            # Подготовка данных для текущего сенсора
             data = query_influx_data(
                 measurement="vibration_metrics",
                 field="total_rms",
@@ -496,9 +508,46 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
                 sensor_name=sensor_name,
                 time_range=time_range
             )
-            data_dict[sensor_name] = data
-            thresholds[sensor_name] = current_thresholds["vibration"]
+            data_dict = {sensor_name: data}
+            thresholds = {sensor_name: current_thresholds["vibration"]}
+
+            # Генерация графика
+            plot_buf = generate_multi_sensor_plot(
+                data_dict,
+                title=f"Vibration Data - {sensor_name.capitalize()} ({device_id})",
+                ylabel="Acceleration (g)",
+                thresholds=thresholds,
+                time_range=time_range
+            )
+
+            # Отправка графика
+            moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+            if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
+                try:
+                    start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
+                    stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
+                    start_time_moscow = start_time.astimezone(moscow_tz).strftime('%Y-%m-%d %H:%M:%S')
+                    stop_time_moscow = stop_time.astimezone(moscow_tz).strftime('%Y-%m-%d %H:%M:%S')
+                    display_range = f"from {start_time_moscow} to {stop_time_moscow} (Moscow time)"
+                except ValueError:
+                    display_range = "Invalid custom time range"
+            elif isinstance(time_range, str):
+                display_range = f"Last {time_range.replace('-', '')} (Moscow time)"
+            else:
+                display_range = "Unknown time range"
+
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=plot_buf,
+                caption=(f"Vibration data for {sensor_name.capitalize()} ({device_id})\nTime range: {display_range}" +
+                         (f"\nNo data available in this time range." if data.empty else "")),
+                reply_markup=InlineKeyboardMarkup(add_global_buttons([]))
+            )
+
+    # Графики для температурных сенсоров
     elif sensor_group in ["temp", "temperature"]:
+        data_dict = {}
+        thresholds = {}
         for field in ["engine_temp", "gearbox_temp"]:
             data = query_influx_data(
                 measurement="temperature",
@@ -508,7 +557,26 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             )
             data_dict[field] = data
             thresholds[field] = current_thresholds["temperature"]
+
+        plot_buf = generate_multi_sensor_plot(
+            data_dict,
+            title=f"Temperature Data ({device_id})",
+            ylabel="Temperature (°C)",
+            thresholds=thresholds,
+            time_range=time_range
+        )
+
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=plot_buf,
+            caption=f"Temperature data for {device_id}\nTime range: {time_range}",
+            reply_markup=InlineKeyboardMarkup(add_global_buttons([]))
+        )
+
+    # Графики для токовых сенсоров
     elif sensor_group == "current":
+        data_dict = {}
+        thresholds = {}
         for sensor_name in ["phase_a", "phase_b", "phase_c"]:
             data = query_influx_data(
                 measurement="current",
@@ -518,45 +586,28 @@ async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_T
             )
             data_dict[sensor_name] = data
             thresholds[sensor_name] = current_thresholds["current"]
-    plot_buf = generate_multi_sensor_plot(
-        data_dict,
-        title=f"{sensor_group.capitalize()} Data - {device_id}",
-        ylabel="Value",
-        thresholds=thresholds,
-        time_range=time_range
-    )
-    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
-    if isinstance(time_range, dict) and "start" in time_range and "stop" in time_range:
-        try:
-            start_time = datetime.datetime.fromisoformat(time_range["start"].replace("Z", "+00:00"))
-            stop_time = datetime.datetime.fromisoformat(time_range["stop"].replace("Z", "+00:00"))
-            start_time_moscow = start_time.astimezone(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-            stop_time_moscow = stop_time.astimezone(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')
-            display_range = f"from {start_time_moscow} to {stop_time_moscow} (Moscow time)"
-        except ValueError:
-            display_range = "Invalid custom time range"
-    elif isinstance(time_range, str):
-        display_range = f"Last {time_range.replace('-', '')} (Moscow time)"
-    else:
-        display_range = "Unknown time range"
-    await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=plot_buf,
-        caption=(f"{sensor_group.capitalize()} data for {device_id}\nTime range: {display_range}" +
-                 (f"\nNo data available in this time range." if not any(
-                     not data.empty for data in data_dict.values()) else "")),
-        reply_markup=InlineKeyboardMarkup(add_global_buttons([]))
-    )
+
+        plot_buf = generate_multi_sensor_plot(
+            data_dict,
+            title=f"Current Data ({device_id})",
+            ylabel="Current (A)",
+            thresholds=thresholds,
+            time_range=time_range
+        )
+
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=plot_buf,
+            caption=f"Current data for {device_id}\nTime range: {time_range}",
+            reply_markup=InlineKeyboardMarkup(add_global_buttons([]))
+        )
 # Обработчик "Новый запрос"
 async def new_request_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для начала нового запроса. Аналогично /start."""
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    user_data_cache.pop(user_id, None)
-    try:
-        await query.delete_message()
-    except Exception as e:
-        print(f"Ошибка при удалении сообщения: {e}")
+    await reset_state(update, context)
+
     devices = ["station_1", "station_2", "station_3"]
     keyboard = [[InlineKeyboardButton(dev, callback_data=f"device_{dev}")] for dev in devices]
     keyboard = add_global_buttons(keyboard)
@@ -569,26 +620,41 @@ async def new_request_selected(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- Обработчик "Настройки" и редактирования порогов ---
 async def settings_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для перехода в настройки устройства."""
     if update.callback_query:
         query = update.callback_query
         try:
             await query.answer()
         except Exception as e:
             print("Ошибка в settings_selected:", e)
+
+    # Получаем ID пользователя и устройство
     user_id = update.effective_user.id
-    device_id = user_data_cache.get(user_id, {}).get("device_id", "unknown_device")
+    device_id = user_data_cache.get(user_id, {}).get("device_id")
+
+    # Если device_id отсутствует, возвращаем сообщение об ошибке
+    if not device_id:
+        await update.callback_query.edit_message_text(
+            "Ошибка: Устройство не выбрано. Начните с команды /start."
+        )
+        return SELECTING_DEVICE
+
+    # Проверяем, есть ли настройки для устройства, если нет — создаём с дефолтными значениями
     if device_id not in device_thresholds:
         device_thresholds[device_id] = {
             "vibration": DEFAULT_THRESHOLDS["vibration"]["total_rms"],
             "temperature": DEFAULT_THRESHOLDS["temperature"]["engine_temp"],
             "current": DEFAULT_THRESHOLDS["current"]["phase_a"]
         }
+
+    # Отображаем текущие настройки
     current_settings = device_thresholds[device_id]
     text = (f"Настройки для {device_id}:\n"
             f"Вибрация (total_rms): {current_settings['vibration']}\n"
             f"Температура (engine_temp): {current_settings['temperature']}\n"
             f"Ток (phase_a): {current_settings['current']}\n"
             "Выберите параметр для изменения:")
+
     kb = [
         [InlineKeyboardButton("Изменить вибрацию", callback_data="edit_vib")],
         [InlineKeyboardButton("Изменить температуру", callback_data="edit_temp")],
@@ -596,6 +662,7 @@ async def settings_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Вернуться", callback_data="settings_back")]
     ]
     reply_markup = InlineKeyboardMarkup(kb)
+
     await edit_or_send(update, context, text, reply_markup)
     return SETTINGS
 
@@ -619,20 +686,32 @@ async def edit_current_selected(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def process_edit_vibration(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    device_id = user_data_cache.get(user_id, {}).get("device_id", "unknown_device")
+    device_id = user_data_cache.get(user_id, {}).get("device_id")
+
+    # Если device_id отсутствует
+    if not device_id:
+        await update.message.reply_text("Ошибка: Устройство не выбрано. Начните с команды /start.")
+        return SELECTING_DEVICE
+
     try:
         new_val = float(update.message.text)
         device_thresholds[device_id]["vibration"] = new_val
         await update.message.reply_text(f"Порог вибрации для {device_id} обновлён до {new_val}.")
-        save_thresholds()
+        save_thresholds()  # Сохранение в файл
     except ValueError:
         await update.message.reply_text("Неверное значение. Введите число:")
         return EDIT_VIBRATION
+
     return await settings_selected(update, context)
 
 async def process_edit_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    device_id = user_data_cache.get(user_id, {}).get("device_id", "unknown_device")
+    device_id = user_data_cache.get(user_id, {}).get("device_id")
+
+    if not device_id:
+        await update.message.reply_text("Ошибка: Устройство не выбрано. Начните с команды /start.")
+        return SELECTING_DEVICE
+
     try:
         new_val = float(update.message.text)
         device_thresholds[device_id]["temperature"] = new_val
@@ -641,11 +720,17 @@ async def process_edit_temperature(update: Update, context: ContextTypes.DEFAULT
     except ValueError:
         await update.message.reply_text("Неверное значение. Введите число:")
         return EDIT_TEMPERATURE
+
     return await settings_selected(update, context)
 
 async def process_edit_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    device_id = user_data_cache.get(user_id, {}).get("device_id", "unknown_device")
+    device_id = user_data_cache.get(user_id, {}).get("device_id")
+
+    if not device_id:
+        await update.message.reply_text("Ошибка: Устройство не выбрано. Начните с команды /start.")
+        return SELECTING_DEVICE
+
     try:
         new_val = float(update.message.text)
         device_thresholds[device_id]["current"] = new_val
@@ -654,6 +739,7 @@ async def process_edit_current(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError:
         await update.message.reply_text("Неверное значение. Введите число:")
         return EDIT_CURRENT
+
     return await settings_selected(update, context)
 
 async def settings_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,13 +764,18 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
 
+
 def main():
     load_thresholds()  # Загружаем сохраненные пороговые значения
+
     while True:
         try:
             app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
             conv_handler = ConversationHandler(
-                entry_points=[CommandHandler("start", start)],
+                entry_points=[
+                    CommandHandler("start", start),  # Обработчик команды /start
+                ],
                 states={
                     SELECTING_DEVICE: [
                         CallbackQueryHandler(device_selected, pattern=r"^device_"),
@@ -749,14 +840,18 @@ def main():
                 },
                 fallbacks=[
                     CommandHandler("cancel", cancel),
+                    CommandHandler("start", start),  # Позволяет сбросить состояние через /start
                     CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"),
                     CallbackQueryHandler(settings_selected, pattern=r"^settings$")
                 ]
             )
+
             app.add_handler(conv_handler)
             app.add_error_handler(global_error_handler)
+
             print("Bot started")
             app.run_polling()
+
         except Exception as e:
             print("Бот обнаружил фатальную ошибку и перезапускается:", e)
             time.sleep(5)
