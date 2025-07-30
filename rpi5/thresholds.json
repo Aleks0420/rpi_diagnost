@@ -1,7 +1,31 @@
 {
-    "unknown_device": {
-        "vibration": 0.8,
+    "station_1": {
+        "vibration": 0.05,
         "temperature": 80.0,
         "current": 5.0
+    },
+    "station_2": {
+        "vibration": {
+            "engine": 1.7,
+            "gearbox": 1.3
+        },
+        "temperature": 85.0,
+        "current": 6.0
+    },
+    "station_3": {
+        "vibration": {
+            "engine": 1.4,
+            "gearbox": 1.1
+        },
+        "temperature": 75.0,
+        "current": 4.5
+    },
+    "unknown_device": {
+        "vibration": {
+            "engine": 1.0,
+            "gearbox": 1.0
+        },
+        "temperature": 70.0,
+        "current": 3.0
     }
 }
