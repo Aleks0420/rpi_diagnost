@@ -36,7 +36,7 @@ INFLUXDB_BUCKET = "eng_bucket"
 
 # --- Конфигурация Telegram бота ---
 TELEGRAM_TOKEN = "7882919864:AAH9wV2YYW625b9RsQPrzl87wpv8cgPFWVA"
-ALLOWED_USER_IDS = [703548391]
+ALLOWED_USER_IDS = [703548391, ]
 
 # --- Таймзона ---
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -301,44 +301,32 @@ async def device_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SELECTING_SENSORS
 
 async def sensors_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработчик выбора группы сенсоров:
-    - Для тока (current) перенаправляет на выбор фаз.
-    - Для вибрации (vibration) и температуры (temperature) переходит к выбору временного диапазона.
-    """
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     sensor_group = query.data.replace("sensor_", "")
     user_data_cache[user_id]["sensor_group"] = sensor_group
 
-    # Если группа сенсоров — ток (current), переходим к выбору фаз
     if sensor_group == "current":
+        # Переходим к выбору фаз тока
         return await current_selected(update, context)
 
-    # Для вибрации и температуры сразу предлагаем выбор временного диапазона
+    # Для остальных групп сенсоров
     keyboard = [
-        [InlineKeyboardButton("Последний час", callback_data="range_-1h")],
-        [InlineKeyboardButton("Последние 24 часа", callback_data="range_-24h")],
-        [InlineKeyboardButton("Последние 7 дней", callback_data="range_-7d")],
-        [InlineKeyboardButton("Произвольный диапазон", callback_data="range_custom")]
+        [InlineKeyboardButton("Last 1 hour", callback_data="range_-1h")],
+        [InlineKeyboardButton("Last 24 hours", callback_data="range_-24h")],
+        [InlineKeyboardButton("Last 7 days", callback_data="range_-7d")],
+        [InlineKeyboardButton("Custom range", callback_data="range_custom")]
     ]
     keyboard = add_global_buttons(keyboard)
-
-    await query.edit_message_text(f"Выбрана группа сенсоров: {sensor_group}\nВыберите временной диапазон:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(f"Sensor group: {sensor_group}\nSelect time range:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECTING_RANGE
 
 async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user_id = update.effective_user.id
     time_range = query.data.replace("range_", "")
-
-    # Сохраняем выбранный временной диапазон
-    user_data_cache[user_id]["time_range"] = time_range
-
-    # Если выбран произвольный диапазон, запрашиваем начальную дату
     if time_range == "custom":
         kb = [
             [InlineKeyboardButton("Календарь", callback_data="start_option_calendar")],
@@ -346,18 +334,17 @@ async def range_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text("Выберите способ ввода начальной даты:", reply_markup=InlineKeyboardMarkup(kb))
         return SELECTING_START_DATE_OPTION
-
-    # Если диапазон выбран, переходим к выбору фаз
-    keyboard = [
-        [InlineKeyboardButton("Все фазы", callback_data="current_all")],
-        [InlineKeyboardButton("Фаза A", callback_data="current_phase_a")],
-        [InlineKeyboardButton("Фаза B", callback_data="current_phase_b")],
-        [InlineKeyboardButton("Фаза C", callback_data="current_phase_c")]
-    ]
-    keyboard = add_global_buttons(keyboard)
-
-    await query.edit_message_text(f"Выбран временной диапазон: {time_range}\nВыберите фазу тока:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECTING_RANGE
+    user_data_cache[user_id]["time_range"] = time_range
+    device_id = user_data_cache[user_id]["device_id"]
+    sensor_group = user_data_cache[user_id]["sensor_group"]
+    await query.edit_message_text("Generating plot(s)...")
+    if sensor_group == "all":
+        await generate_and_send_plot(update, context, device_id, "vibration", time_range)
+        await generate_and_send_plot(update, context, device_id, "temperature", time_range)
+        await generate_and_send_plot(update, context, device_id, "current", time_range)
+    else:
+        await generate_and_send_plot(update, context, device_id, sensor_group, time_range)
+    return SELECTING_DEVICE
 
 # --- Начальная дата ---
 async def start_date_option_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -512,8 +499,6 @@ async def enter_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Неверный формат времени. Введите время в формате HH:MM (Moscow time):")
         return ENTERING_END_TIME
-
-
 
 
 async def generate_and_send_plot(update: Update, context: ContextTypes.DEFAULT_TYPE, device_id, sensor_group, time_range):
@@ -810,18 +795,17 @@ async def current_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     device_id = user_data_cache[user_id]["device_id"]
     user_data_cache[user_id]["sensor_group"] = "current"
 
-    # Инлайн-кнопки для выбора временного диапазона
+    # Создаем кнопки для выбора
     keyboard = [
-        [InlineKeyboardButton("Последний час", callback_data="range_-1h")],
-        [InlineKeyboardButton("Последние 24 часа", callback_data="range_-24h")],
-        [InlineKeyboardButton("Последние 7 дней", callback_data="range_-7d")],
-        [InlineKeyboardButton("Произвольный диапазон", callback_data="range_custom")]
+        [InlineKeyboardButton("Все фазы", callback_data="current_all")],
+        [InlineKeyboardButton("Фаза A", callback_data="current_phase_a")],
+        [InlineKeyboardButton("Фаза B", callback_data="current_phase_b")],
+        [InlineKeyboardButton("Фаза C", callback_data="current_phase_c")],
     ]
     keyboard = add_global_buttons(keyboard)
 
-    await query.edit_message_text(f"Устройство: {device_id}\nВыберите временной диапазон для токовых графиков:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(f"Выбрано устройство: {device_id}\nВыберите фазу тока:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECTING_RANGE
-
 
 
 async def generate_current_plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -835,7 +819,7 @@ async def generate_current_plot(update: Update, context: ContextTypes.DEFAULT_TY
 
     user_id = update.effective_user.id
     device_id = user_data_cache[user_id]["device_id"]
-    time_range = user_data_cache[user_id].get("time_range", "-1h")  # По умолчанию последний час
+    time_range = user_data_cache[user_id].get("time_range", "-1h")
 
     # Определяем, какую фазу рисовать
     phase = query.data.replace("current_", "")
@@ -996,31 +980,72 @@ def main():
                     CommandHandler("start", start),
                 ],
                 states={
-                    SELECTING_DEVICE: [CallbackQueryHandler(device_selected, pattern="^device_")],
+                    SELECTING_DEVICE: [
+                        CallbackQueryHandler(device_selected, pattern=r"^device_"),
+                        CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
+                    ],
                     SELECTING_SENSORS: [
-                        CallbackQueryHandler(sensors_selected, pattern="^sensor_"),
+                        CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"),
+                        CallbackQueryHandler(sensors_selected, pattern=r"^sensor_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$"),
                         CallbackQueryHandler(current_selected, pattern="^current_"),
                     ],
                     SELECTING_RANGE: [
-                        CallbackQueryHandler(range_selected, pattern="^range_"),
+                        CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"),
+                        CallbackQueryHandler(range_selected, pattern=r"^range_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$"),
                         CallbackQueryHandler(generate_current_plot, pattern="^current_"),
                     ],
                     SELECTING_START_DATE_OPTION: [
-                        CallbackQueryHandler(start_date_option_selected, pattern="^start_option_"),
-                    ],
-                    SELECTING_END_DATE_OPTION: [
-                        CallbackQueryHandler(end_date_option_selected, pattern="^end_option_"),
+                        CallbackQueryHandler(start_date_option_selected, pattern=r"^start_option_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
                     ],
                     SELECTING_START_DATE_CALENDAR: [
-                        CallbackQueryHandler(start_calendar_callback, pattern="^startcal_"),
+                        CallbackQueryHandler(start_calendar_callback, pattern=r"^startcal_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
+                    ],
+                    ENTERING_START_DATE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, enter_start_date)
+                    ],
+                    ENTERING_START_TIME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, enter_start_time)
+                    ],
+                    SELECTING_END_DATE_OPTION: [
+                        CallbackQueryHandler(end_date_option_selected, pattern=r"^end_option_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
                     ],
                     SELECTING_END_DATE_CALENDAR: [
-                        CallbackQueryHandler(end_calendar_callback, pattern="^endcal_"),
+                        CallbackQueryHandler(end_calendar_callback, pattern=r"^endcal_"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
                     ],
-                    ENTERING_START_DATE: [MessageHandler(filters.TEXT, enter_start_date)],
-                    ENTERING_START_TIME: [MessageHandler(filters.TEXT, enter_start_time)],
-                    ENTERING_END_DATE: [MessageHandler(filters.TEXT, enter_end_date)],
-                    ENTERING_END_TIME: [MessageHandler(filters.TEXT, enter_end_time)],
+                    ENTERING_END_DATE: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, enter_end_date)
+                    ],
+                    ENTERING_END_TIME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, enter_end_time)
+                    ],
+                    SETTINGS: [
+                        CallbackQueryHandler(edit_vibration_selected, pattern=r"^edit_vib$"),
+                        CallbackQueryHandler(edit_temperature_selected, pattern=r"^edit_temp$"),
+                        CallbackQueryHandler(edit_current_selected, pattern=r"^edit_curr$"),
+                        CallbackQueryHandler(settings_back, pattern=r"^settings_back$"),
+                        CallbackQueryHandler(new_request_selected, pattern=r"^new_request$"),
+                        CallbackQueryHandler(settings_selected, pattern=r"^settings$")
+                    ],
+                    EDIT_VIBRATION: [
+                        CallbackQueryHandler(select_vib_sensor, pattern=r"^edit_vib_(engine|gearbox)$"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_vibration)
+                    ],
+                    EDIT_TEMPERATURE: [
+                        CallbackQueryHandler(select_temp_sensor, pattern=r"^edit_temp_(engine|gearbox)$"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_temperature)
+                    ],
+                    EDIT_CURRENT: [
+                        CallbackQueryHandler(select_current_phase,
+                                             pattern=r"^edit_curr_phase_(phase_a|phase_b|phase_c)$"),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, process_edit_current)
+                    ],
                 },
                 fallbacks=[
                     CommandHandler("cancel", cancel),
