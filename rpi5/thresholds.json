@@ -1,31 +1,46 @@
 {
     "station_1": {
-        "vibration": 0.05,
-        "temperature": 80.0,
-        "current": 5.0
+        "vibration": {
+            "engine": 0.5,
+            "gearbox": 0.025
+        },
+        "temperature": {
+            "engine_temp": 75.0,
+            "gearbox_temp": 40.0
+        },
+        "current": {
+            "phase_a": 4.2,
+            "phase_b": 4.3,
+            "phase_c": 4.4
+        }
     },
     "station_2": {
         "vibration": {
-            "engine": 1.7,
-            "gearbox": 1.3
+            "engine": 0.6,
+            "gearbox": 0.02
         },
-        "temperature": 85.0,
-        "current": 6.0
+        "temperature": {
+            "engine_temp": 70.0,
+            "gearbox_temp": 40.0
+        },
+        "current": {
+            "phase_a": 4.0,
+            "phase_b": 4.1,
+            "phase_c": 4.2
+        }
     },
     "station_3": {
         "vibration": {
-            "engine": 1.4,
-            "gearbox": 1.1
+            "engine": 0.6,
+            "gearbox": 0.02
         },
-        "temperature": 75.0,
-        "current": 4.5
-    },
-    "unknown_device": {
-        "vibration": {
-            "engine": 1.0,
-            "gearbox": 1.0
+        "temperature": {
+            "engine_temp": 70.0,
+            "gearbox_temp": 40.0
         },
-        "temperature": 70.0,
-        "current": 3.0
-    }
+        "current": {
+            "phase_a": 4.0,
+            "phase_b": 4.1,
+            "phase_c": 4.2
+        }
 }
